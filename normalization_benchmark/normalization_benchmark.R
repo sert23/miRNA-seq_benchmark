@@ -6,17 +6,139 @@ library(ggplot2)
 library(dplyr)
 library(tidyverse)
 library(reshape2)
+library(htmlwidgets)
+library(plotly)
+library(tidyr)
+library(ggnewscale)
+library(compositions)
+library(zCompositions)
 
 
 source("R/normalization.R")
 plot_dir <- "./plots/"
 dir.create(plot_dir, recursive = TRUE)
+minRPM <- 50
+
+# name map
+name_map <- c(
+  "RPM_total"                = "RPM (total)",
+  "RPM_lib"                = "RPM",
+  "TMM"                      = "edgeR - TMM",
+  "rlog_parametric_blind_TRUE"  = "DESeq2 - rlog (parametric)",
+  "rlog_mean_blind_FALSE"       = "DESeq2 - rlog (mean)",
+  "vst_local_blind_TRUE"        = "DESeq2 - VST (local)",
+  "RC"                       = "Raw read count",
+  "MAP" = "MAP"
+)
+
+# make monotonicity example figure first
+if (TRUE){
+  set.seed(42)  # make the jitter reproducible
+  
+  p_df <- data.frame(
+    Sample = factor(
+      c("0S (pure liver)", "20S", "40S", "60S", "80S", "100S (pure spleen)"),
+      levels = c("0S (pure liver)", "20S", "40S", "60S", "80S", "100S (pure spleen)")
+    ),
+    Counts = c(5, 18, 35, 55, 75, 95)
+  )
+  
+  # compute the decreasing values, with jitter on 60S
+  p_df2 <- p_df %>%
+    mutate(
+      Dec = 100 - Counts,
+      Dec = ifelse(
+        Sample == "60S",
+        Dec + sample(-10:10, 1),
+        Dec
+      )
+    )
+  
+  # choose a palette
+  inc_col <- "#1f78b4"  # blue = increasing
+  dec_col <- "#e31a1c"  # red  = decreasing
+  
+  gg <- ggplot(p_df2, aes(x = Sample)) +
+    # blue = increasing
+    geom_col(
+      aes(y    = Counts, fill = "Monotonic increase"),
+      position     = position_nudge(x = -0.2),
+      width        = 0.4
+    ) +
+    # red = decreasing
+    geom_col(
+      aes(y    = Dec, fill = "Monotonic decrease"),
+      position     = position_nudge(x =  0.2),
+      width        = 0.4
+    ) +
+    scale_fill_manual(
+      name   = NULL,
+      values = c(
+        "Monotonic increase" = inc_col,
+        "Monotonic decrease" = dec_col
+      )
+    ) +
+    labs(
+      title = "Monotonic trends in the expression of a miRNA",
+      x     = NULL,
+      y     = "miRNA-X counts"
+    ) +
+    theme_minimal() +
+    theme_minimal(base_size = 14) +        # increase base font size
+    theme(
+      text                = element_text(size = 14),       # all text
+      axis.title          = element_text(size = 14),       # axis titles
+      axis.text.x         = element_text(size = 14, angle = 45, hjust = 1),
+      axis.text.y         = element_text(size = 14),
+      plot.title          = element_text(size = 16, hjust = 0.5),
+      legend.title        = element_text(size = 14),
+      legend.text         = element_text(size = 14),
+      legend.position     = "bottom",
+      legend.justification= "center",
+      legend.direction    = "horizontal"
+    )
+  
+  pdf(paste0(plot_dir, "example_monotonicity.pdf"), width = 8, height = 6)  
+  print(gg)  
+  dev.off()  
+}
+
+#### create resampled RC matrix
+if (TRUE){
+  # read original RC matrix
+  RC_df <- read.delim("./data/mature_sense_minExpr0_RCadj.mat",
+                      check.names = FALSE, row.names = 1)
+  # count min amount of total reads
+  col_sums <- colSums(RC_df)
+  min_am  <- min(col_sums) # 12214826, let's sample 10M
+  
+  # calculate probabilities
+  prob_df <- sweep(RC_df, 
+                   MARGIN = 2, 
+                   STATS  = colSums(RC_df), 
+                   FUN    = "/")
+  # sample 10M for each column
+  n_feats   <- nrow(prob_df)
+  n_draws   <- 1e7  # 10 million
+  
+  sampled_mat <- sapply(seq_len(ncol(prob_df)), function(i) {
+    sample_counts_col(prob_df[[i]])
+  })
+  
+  # Convert to data.frame and restore row/col names
+  sampled_df <- as.data.frame(sampled_mat,
+                              row.names = rownames(prob_df))
+  colnames(sampled_df) <- colnames(prob_df)
+  
+  RC_df <- sampled_df
+  
+  
+}
 
 # load RC matrix
 
-RC_df <- read.delim("./data/mature_sense_minExpr0_RCadj.mat",
-                    check.names = FALSE, row.names = 1)
-
+# RC_df <- read.delim("./data/mature_sense_minExpr0_RCadj.mat",
+#                     check.names = FALSE, row.names = 1)
 # fix names
 colnames(RC_df) <- fix_names(colnames(RC_df))
 
@@ -26,11 +148,9 @@ print(head(RC_df))
 groups_object <- define_groups(RC_df)
 
 # some mixture_group are missing
-
 column_data <- data.frame(row.names = colnames(RC_df))
 column_data$mixture_group <- sapply(rownames(column_data), 
                                     function(x) get_group(x,groups_object$group_members))
-
 # log transform
 logged_df <- log2(RC_df + 1)
 
@@ -38,18 +158,64 @@ logged_df <- log2(RC_df + 1)
 RPMt_df <- read.delim("./data/mature_sense_minExpr0_RCadj_totalRPM.mat",
                       check.names = FALSE, row.names = 1)
 colnames(RPMt_df) <- fix_names(colnames(RPMt_df))
-# RPM lib
 
-RPMl_df <- read.delim("./data/mature_sense_minExpr0_RCadj_libraryRPM.mat",
-                      check.names = FALSE, row.names = 1)
-colnames(RPMl_df) <- fix_names(colnames(RPMl_df))
+# RPM lib (recalculated from resampled 10M RC)
+RPMl_df <- RC_df / colSums(RC_df) * 1e6
+
+# loading sRNAbench matrix
+# RPMl_df <- read.delim("./data/mature_sense_minExpr0_RCadj_libraryRPM.mat",
+#                       check.names = FALSE, row.names = 1)
+# colnames(RPMl_df) <- fix_names(colnames(RPMl_df))
 
 list_of_transformations <- list(RC = RC_df, 
                                 # logged = logged_df, 
-                                RPM_total = RPMt_df
-                                # RPM_lib = RPMl_df
+                                RPM_total = RPMt_df,
+                                RPM_lib = RPMl_df
                                 )
 
+
+# add Matt's function for MAP here
+if (TRUE){
+  # 1. Compute library sizes and counts
+  lib_sizes <- colSums(RC_df)
+  I <- nrow(RC_df)
+  alpha <- 1               # uniform prior concentration
+  n_j <- lib_sizes
+  alpha_j <- rep(alpha, length(n_j))
+  
+  # 2. Compute MLE proportions
+  pi_mle <- sweep(RC_df, 2, lib_sizes, FUN = "/")
+  
+  # 3. Apply MAP shrinkage column‐wise
+  pi_map <- sapply(seq_len(ncol(pi_mle)), function(j) {
+    map_estimator(
+      pi_mle = pi_mle[, j],
+      I      = I,
+      alpha_j= alpha_j[j],
+      n_j    = n_j[j]
+    )
+  })
+  # restore dimnames
+  rownames(pi_map) <- rownames(pi_mle)
+  colnames(pi_map) <- colnames(pi_mle)
+}
+list_of_transformations$MAP <- pi_map
+
+# CLR
+if(TRUE){
+  # pi_mle proportions
+  prop_df <- pi_mle
+  prop_df_filt <- cmultRepl(prop_df, method = "CZM", output = "prop")
+  clr_df <- clr(acomp(prop_df_filt))
+}
+# list_of_transformations$CLR <- clr_df
+
+# check for any NAs
+any_na <- any(is.na(clr_df))
+na_positions <- which(is.na(clr_df), arr.ind = TRUE)
+
+cat("Any NAs?", any_na, "\n")
+print(na_positions)
 
 # for blind False
 # colData add another column (mixture group)
@@ -132,7 +298,7 @@ if(TRUE){
 }
 
 # edgeR transformation TMM
-dge <- DGEList(counts = RC_df)
+if(TRUE){dge <- DGEList(counts = RC_df)
 
 # Calculate normalization factors using TMM
 dge <- calcNormFactors(dge, method = "TMM")
@@ -140,13 +306,14 @@ dge <- calcNormFactors(dge, method = "TMM")
 # To extract the TMM-normalized values (on a per-million scale)
 tmm_counts <- cpm(dge, normalized.lib.sizes = TRUE)
 list_of_transformations[["TMM"]] <- as.data.frame(tmm_counts)
+}
 
 # define groups
 group_obj <- define_groups(RC_df)
 groups <- group_obj$group_members
 group_list <- group_obj$group_list
 
-# make dataframe of reliable FC for monotonicity evaluation
+# group RPM
 if (TRUE){
   group_RPMs <- list()
   for (group in group_list) {
@@ -191,143 +358,9 @@ if (TRUE){
   group_extended$abs_log2FC <- abs(group_extended$log2FC)
 }
 
-# 3 sets
-# |logFC| > 0.1, .5 1 
-# min 50 RPM average
-# 
-# increase_df_01 <- group_extended[abs(group_extended$log2FC) > 0.1, ]
-# increase_df_05 <- group_extended[abs(group_extended$log2FC) > 0.5, ]
-# increase_df_1 <- group_extended[abs(group_extended$log2FC) > 1, ]
-
-## check monotonic trend for each method
-
-if (TRUE){
-  monotonic_list <- list()
-  
-  # for every key in transformations
-  # calculate group geometric average
-  # calculate monotonicity of each miRNA
-  
-  final_results <- data.frame(
-    transformation = character(),
-    top_n = integer(),
-    percentage_agreement = numeric(),
-    stringsAsFactors = FALSE
-  )
-  
-  final_log2 <- data.frame(
-    transformation = character(),
-    top_n = integer(),
-    percentage_agreement = numeric(),
-    stringsAsFactors = FALSE
-  )
-  
-  for (i in seq_along(list_of_transformations)) {
-    # Access the current dataframe
-    key_name <- names(list_of_transformations)[i]
-    temp_df <- list_of_transformations[[i]]
-    # make same row order (miRNAs)
-    group_df <- geometric_mean_by_group(temp_df, groups)
-    results_df <- data.frame(matrix(nrow = nrow(temp_df), ncol = 0))
-    rownames(results_df) <- rownames(group_df)
-    results_df$monotonicity <- apply(group_df, 1, check_monotonicity)
-    # add putative column
-    results_df$putative_direction <- group_extended$FC_direction
-    # average expression column
-    results_df$average_RPM <- group_extended$average
-    # add log2FC column
-    results_df$log2FC <- group_extended$abs_log2FC
-    # calculate agreement
-    results_df$agreement <- ifelse(results_df$monotonicity == results_df$putative_direction, 1, 0)
-    filtered_df <- results_df[results_df$average_RPM >= 50, ]
-    # Sort by average_RPM in descending order
-    sorted_df <- filtered_df[order(-filtered_df$average_RPM), ]
-    top_n_values <- c(1, 5, 10, 20, 50, seq(60, nrow(sorted_df), by = 10))
-    
-    for (top_n in top_n_values) {
-      # Ensure top_n does not exceed the number of rows
-      top_n <- min(top_n, nrow(sorted_df))
-      
-      # Subset the top N rows
-      top_subset <- sorted_df[1:top_n, ]
-      
-      # Calculate the percentage of agreement
-      percentage_agreement <- mean(top_subset$agreement) * 100
-      
-      # Add results to final_results
-      final_results <- rbind(final_results, data.frame(
-        transformation = key_name,
-        top_n = top_n,
-        percentage_agreement = percentage_agreement,
-        stringsAsFactors = FALSE
-      ))
-    }
-    
-    sorted_df <- filtered_df[order(-filtered_df$log2FC), ]
-    
-    for (top_n in top_n_values) {
-      # Ensure top_n does not exceed the number of rows
-      top_n <- min(top_n, nrow(sorted_df))
-      
-      # Subset the top N rows
-      top_subset <- sorted_df[1:top_n, ]
-      
-      # Calculate the percentage of agreement
-      percentage_agreement <- mean(top_subset$agreement) * 100
-      
-      # Add results to final_results
-      final_log2 <- rbind(final_log2, data.frame(
-        transformation = key_name,
-        top_n = top_n,
-        percentage_agreement = percentage_agreement,
-        stringsAsFactors = FALSE
-      ))
-    }
-  }
-  
-  # print(head(final_results, 20))
-  # print(head(final_log2, 20))
-}
-
-# Define a limited set of colors and shapes
-# color_palette <- scales::hue_pal()(7)  # Use 7 distinct colors
-# shape_palette <- c(16, 17, 18)         # Use 3 distinct shapes (circle, triangle, diamond)
-# 
-# # Map transformations to a combined color and shape grouping
-# final_results$color_group <- factor(as.numeric(final_results$transformation) %% 7 + 1)  # 7 colors
-# final_results$shape_group <- factor(as.numeric(final_results$transformation) %% 3 + 1)  # 3 shapes
-# 
-# final_log2$color_group <- factor(as.numeric(final_log2$transformation) %% 7 + 1)  # 7 colors
-# final_log2$shape_group <- factor(as.numeric(final_log2$transformation) %% 3 + 1)  # 3 shapes
-
-
-gg <- ggplot(final_results, aes(x = top_n, y = percentage_agreement, color = transformation)) +
-  geom_line() +
-  geom_point() +
-  # scale_x_log10() +  # Optional: Log scale for top_n
-  labs(x = "Top n miRNAs (expression)", y = "Percentage Monotonic (%)", 
-       title = "percentage monotonic expression of the top expressed miRNAs") +
-  theme_minimal()
-
-
-pdf(paste0(plot_dir, "percentage_monotonic_expression.pdf"), width = 8, height = 6)  
-print(gg)  
-dev.off()  
-
-gg <- ggplot(final_log2, aes(x = top_n, y = percentage_agreement, color = transformation)) +
-  geom_line() +
-  geom_point() +
-  # scale_x_log10() +  # Optional: Log scale for top_n
-  labs(x = "Top n miRNAs (absolute log2FC)", y = "Percentage Monotonic (%)", 
-       title = "percentage of monotonic expression of the top DE miRNAs") +
-  theme_minimal()
-
-pdf(paste0(plot_dir, "percentage_monotonic_log2FC.pdf"), width = 8, height = 6)  
-print(gg)  
-dev.off() 
 
 #######
-##### repeat analysis but relative (using each transformation as internal reference)
+##### evaluate monotonic trend for each method
 #######
 
 if (TRUE){
@@ -346,8 +379,10 @@ if (TRUE){
   )
   
   for (i in seq_along(list_of_transformations)) {
+    
     # Access the current dataframe
     key_name <- names(list_of_transformations)[i]
+    print(key_name)
     temp_df <- list_of_transformations[[i]]
     # make same row order (miRNAs)
     group_df <- geometric_mean_by_group(temp_df, groups)
@@ -362,12 +397,17 @@ if (TRUE){
     results_df$average <- rowMeans(group_df)
     results_df$average_RPM <- group_extended$average
     # calculate agreement
-    results_df$agreement <- ifelse(results_df$monotonicity == results_df$putative_direction, 1, 0)
+    # results_df$agreement <- ifelse(results_df$monotonicity == results_df$putative_direction, 1, 0)
+    results_df$agreement <- ifelse(
+      results_df$monotonicity %in% c("increasing", "decreasing"),
+      1,
+      0
+    )
     # use RPM to filter so it's equivalent to all transformations
-    filtered_df <- results_df[results_df$average_RPM >= 50, ]
+    filtered_df <- results_df[results_df$average_RPM >= minRPM, ]
     # Sort by average_RPM in descending order
     sorted_df <- filtered_df[order(-filtered_df$average), ]
-    top_n_values <- c(1, 5, 10, 20, 50, seq(60, nrow(sorted_df), by = 10))
+    top_n_values <- c(5, 10, 20, 50, seq(60, nrow(sorted_df), by = 10))
     
     for (top_n in top_n_values) {
       # Ensure top_n does not exceed the number of rows
@@ -377,6 +417,8 @@ if (TRUE){
       top_subset <- sorted_df[1:top_n, ]
       
       # Calculate the percentage of agreement
+      # percentage_agreement <- mean(top_subset$agreement) * 100
+      # Calculate the percentage of monotonic
       percentage_agreement <- mean(top_subset$agreement) * 100
       
       # Add results to final_results
@@ -422,172 +464,831 @@ if (TRUE){
   
   old_group_extended <- group_extended
   
+  methods <- unique(final_results$transformation)
+  pal_hex <- unname(grDevices::palette.colors())
+  pal_hex <- pal_hex[pal_hex != "#000000"]
+  cols_use <- pal_hex[seq_along(methods)]
+  colour_map <- setNames(cols_use, methods)
+  
+  
+  ## fix levels to mimic order in legend
+  
+  order_levels <- final_results %>%
+    filter(top_n == max(top_n)) %>%               # pick the last x‐value
+    arrange(desc(percentage_agreement)) %>%        # sort so highest % is first
+    pull(transformation)                           # extract the transformation names
+  
+  final_results <- final_results %>%
+    mutate(transformation = factor(transformation, levels = order_levels))
   
 }
 
+
+# lineplot % monotonic for top n (expression)
 gg <- ggplot(final_results, aes(x = top_n, y = percentage_agreement, 
-                                color = transformation, shape = transformation_group ) ) +
+                                color = transformation) ) +
   geom_line() +
   geom_point() +
   # scale_x_log10() +  # Optional: Log scale for top_n
-  labs(x = "Top n miRNAs (expression)", y = "Percentage Monotonic (%)", 
-       title = "") +
+  labs(x = "Top n miRNAs (sorted by expression)", y = "Percentage with monotonic trend (%)", 
+       title = "Proportion of top-expressed miRNAs displaying a monotonic trend", 
+       color = "normalization method") +
+  scale_color_manual(
+    name   = "normalization method",
+    values = colour_map,
+    labels = name_map,
+    breaks = order_levels
+  ) +
   theme_minimal()
 
 pdf(paste0(plot_dir, "percentage_monotonic_expres_relative.pdf"), width = 8, height = 6)  
 print(gg)  
 dev.off() 
 
+# lineplot % monotonic for top n (absolute FC)
 gg <- ggplot(final_log2, aes(x = top_n, y = percentage_agreement, 
-                             color = transformation, shape = transformation_group ) ) +
+                             color = transformation) ) +
   geom_line() +
   geom_point() +
   # scale_x_log10() +  # Optional: Log scale for top_n
-  labs(x = "Top n miRNAs (absolute log2FC)", y = "Percentage Monotonic (%)", 
-       title = "percentage of monotonic expression of the top DE miRNAs internally calculated") +
+  labs(x = "Top n miRNAs (sorted by  |log2FC|)", y = "Percentage with monotonic trend (%)", 
+       title = "Proportion of top DE miRNAs displaying a monotonic trend", 
+       color = "normalization method") +
+  scale_color_manual(
+    name   = "normalization method",
+    values = colour_map,
+    labels = name_map,
+    breaks = order_levels
+  ) +
   theme_minimal()
 
 pdf(paste0(plot_dir, "percentage_monotonic_log2FC_relative.pdf"), width = 8, height = 6)
 print(gg)  
-dev.off()  
+dev.off()
 
-#
-##### repeat analysis but using rlog_mean_blind_FALSE as reference
-#
-
+# heatmaps
 if (TRUE){
-  final_results <- data.frame(
-    transformation = character(),
-    top_n = integer(),
-    percentage_agreement = numeric(),
-    stringsAsFactors = FALSE
-  )
+  rpm_key <- grep("RPM", names(list_of_transformations), value = TRUE)[1]
+  rpm_key <- "RPM_lib"
+  # rpm_key <- grep("RPM", names(list_of_transformations), value = TRUE)[1]
   
-  final_log2 <- data.frame(
-    transformation = character(),
-    top_n = integer(),
-    percentage_agreement = numeric(),
-    stringsAsFactors = FALSE
-  )
+  # Compute geometric mean by group for RPM
+  rpm_grp       <- geometric_mean_by_group(list_of_transformations[[rpm_key]], groups)
+  average_RPM   <- rowMeans(rpm_grp)
   
-  temp_df <- list_of_transformations[["rlog_mean_blind_FALSE"]]
-  group_extended <- geometric_mean_by_group(temp_df, groups)
-  group_extended <- as.data.frame(group_extended)
+  # Get the top 100 miRNAs by that average
+  topN <- 100
+  top100 <- names(sort(average_RPM, decreasing = TRUE))[1:topN]
   
-  # Add the average row value column
-  group_extended$average <- rowMeans(group_extended)
-  
-  # Add the FC (fold change) column between 0S and 100S
-  group_extended$FC <- group_extended$`100S` / (group_extended$`0S`)  # Avoid division by zero
-  
-  # Print the extended data frame
-  group_extended$log2FC <- log2(group_extended$FC)
-  group_extended$FC_direction <- ifelse(group_extended$log2FC > 0, "increasing", "decreasing")
-  group_extended$abs_log2FC <- abs(group_extended$log2FC)
-  print("here")
-  for (i in seq_along(list_of_transformations)) {
-    # Access the current dataframe
-    key_name <- names(list_of_transformations)[i]
-    temp_df <- list_of_transformations[[i]]
-    # make same row order (miRNAs)
-    print(key_name)
-    print("3")
-    group_df <- geometric_mean_by_group(temp_df, groups)
-    results_df <- data.frame(matrix(nrow = nrow(temp_df), ncol = 0))
-    rownames(results_df) <- rownames(group_df)
-    results_df$monotonicity <- apply(group_df, 1, check_monotonicity)
-    print("4")
-    # add putative column
-    results_df$putative_direction <- group_extended$FC_direction
-    # average expression column
-    results_df$average_RPM <- old_group_extended$average
-    # add log2FC column
-    results_df$log2FC <- group_extended$abs_log2FC
-    # calculate agreement
-    results_df$agreement <- ifelse(results_df$monotonicity == results_df$putative_direction, 1, 0)
-    filtered_df <- results_df[results_df$average_RPM >= 50, ]
-    # Sort by average_RPM in descending order
-    sorted_df <- filtered_df[order(-filtered_df$average_RPM), ]
-    # print(sorted_df)
-    print(dim(sorted_df))
-    top_n_values <- c(1, 5, 10, 20, 50, seq(60, nrow(sorted_df), by = 10))
+  # ADDING FC COLUMN TO HEATMAP
+  if (FALSE){
     
-    for (top_n in top_n_values) {
-      # Ensure top_n does not exceed the number of rows
-      top_n <- min(top_n, nrow(sorted_df))
-      
-      # Subset the top N rows
-      top_subset <- sorted_df[1:top_n, ]
-      
-      # Calculate the percentage of agreement
-      percentage_agreement <- mean(top_subset$agreement) * 100
-      
-      # Add results to final_results
-      parts <- unlist(strsplit(key_name, "_"))
-      tgroup = parts[1]  # Return the second keyword
-      
-      # Add results to final_results
-      final_results <- rbind(final_results, data.frame(
-        transformation = key_name,
-        transformation_group = tgroup,
-        top_n = top_n,
-        percentage_agreement = percentage_agreement,
+    # generate RAW_DF here
+    RAW_DF <- rpm_grp  
+    print(colnames(RAW_DF))
+    
+    
+    # Compute log2FC from two raw columns (placeholders RAW_DF, COL_A, COL_B)
+    # Ensure miRNA names align to top100 order
+    fc_vec <- log2(
+      RAW_DF[top100, "100S", drop = TRUE] /
+        RAW_DF[top100, "0S" , drop = TRUE]
+    )
+    print(fc_vec)
+    
+    # Build a data frame for the extra column
+    fc_df <- data.frame(
+      miRNA          = top100,
+      transformation = "log2FC",
+      log2FC         = fc_vec,
+      stringsAsFactors = FALSE
+    )
+  
+  
+    
+    # 4. Build a long table of monotonicity for those 100
+    mono_list <- lapply(names(list_of_transformations), function(key) {
+      grp  <- geometric_mean_by_group(list_of_transformations[[key]], groups)
+      grp100 <- grp[top100, , drop = FALSE]                 # only top100 rows
+      mono <- apply(grp100, 1, check_monotonicity)
+      data.frame(
+        miRNA          = rownames(grp100),
+        transformation = key,
+        monotonicity   = mono,
         stringsAsFactors = FALSE
-      ))
-    }
+      )
+    })
+    heat_df <- bind_rows(mono_list)
     
-    sorted_df <- filtered_df[order(-filtered_df$log2FC), ]
+    # 5. Factor levels to fix the x-axis order
+    heat_df <- heat_df %>%
+      mutate(
+        miRNA          = factor(miRNA, levels = top100),
+        transformation = factor(transformation, levels = names(colour_map))
+      )
+    # Make sure factor levels include the new “log2FC” method
+    heat_df <- heat_df %>%
+      bind_rows(fc_df %>%
+                  mutate(
+                    miRNA          = factor(miRNA, levels = top100),
+                    transformation = factor(transformation,
+                                            levels = c(names(colour_map), "log2FC"))
+                  ))
+    gg <- ggplot() +
+      # 1) existing monotonicity tiles
+      geom_tile(
+        data = filter(heat_df, transformation != "log2FC"),
+        aes(x = transformation, y = miRNA, fill = monotonicity),
+        color = "white", linewidth = 0.2
+      ) +
+      # 2) new log2FC tiles
+      geom_tile(
+        data = filter(heat_df, transformation == "log2FC"),
+        aes(x = transformation, y = miRNA, fill = log2FC),
+        color = "white", linewidth = 0.2
+      ) +
+      # scales for monotonicity
+      scale_fill_manual(
+        name   = "Trend",
+        values = c(
+          increasing = "#1b9e77",
+          decreasing = "#d95f02",
+          none       = "#FFFF00"
+        ),
+        labels = c(
+          increasing = "Increasing",
+          decreasing = "Decreasing",
+          none       = "Non-monotonic"
+        ),
+        na.value = "white",
+        guide = guide_legend(order = 1)
+      ) +
+      # continuous scale for the log2FC column only
+      scale_fill_gradient2(
+        name     = "log₂FC",
+        low      = "red",
+        mid      = "white",
+        high     = "green",
+        midpoint = 0,
+        guide    = guide_colorbar(order = 2)
+      ) +
+      scale_x_discrete(
+        labels = c(name_map, log2FC = "log₂FC"),
+        expand = c(0, 0)
+      ) +
+      labs(
+        x     = "Normalization method",
+        y     = paste0("miRNA (top ", topN, " by RPM)"),
+        title = "Per-miRNA monotonic trend + log₂FC"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 6),
+        panel.grid   = element_blank()
+      )
     
-    for (top_n in top_n_values) {
-      # Ensure top_n does not exceed the number of rows
-      top_n <- min(top_n, nrow(sorted_df))
+    pdf(paste0(plot_dir, "top100_wFC.pdf"), width = 8, height = 10)
+    print(gg)  
+    dev.off()
+    
+    quit()
       
-      # Subset the top N rows
-      top_subset <- sorted_df[1:top_n, ]
-      
-      # Calculate the percentage of agreement
-      percentage_agreement <- mean(top_subset$agreement) * 100
-      # Add results to final_results
-      parts <- unlist(strsplit(key_name, "_"))
-      tgroup = parts[1]  # Return the second keyword
-      # Add results to final_results
-      final_log2 <- rbind(final_log2, data.frame(
-        transformation = key_name,
-        transformation_group = tgroup,
-        top_n = top_n,
-        percentage_agreement = percentage_agreement,
-        stringsAsFactors = FALSE
-      ))
-    }
   }
+  
+  
+  # Build a long table of monotonicity for those 100
+  mono_list <- lapply(names(list_of_transformations), function(key) {
+    grp  <- geometric_mean_by_group(list_of_transformations[[key]], groups)
+    grp100 <- grp[top100, , drop = FALSE]                 # only top100 rows
+    mono <- apply(grp100, 1, check_monotonicity)
+    data.frame(
+      miRNA          = rownames(grp100),
+      transformation = key,
+      monotonicity   = mono,
+      stringsAsFactors = FALSE
+    )
+  })
+  heat_df <- bind_rows(mono_list)
+  
+  # Factor levels to fix the x-axis order
+  heat_df <- heat_df %>%
+    mutate(
+      miRNA          = factor(miRNA, levels = top100),
+      transformation = factor(transformation, levels = names(colour_map))
+    )
+  
+  # Draw the heatmap
+  gg <- ggplot(heat_df,
+               aes(x = transformation, y = miRNA, fill = monotonicity)) +
+    geom_tile(color = "white", linewidth = 0.2) +
+    scale_fill_manual(
+      name   = "trend",
+      values = c(increasing = "#1b9e77",
+                 decreasing = "#d95f02",
+                 none       = "#FFFF00"),
+      labels = c(increasing = "Increasing",
+                 decreasing = "Decreasing",
+                 none       = "Non-monotonic"),
+      na.value = "white"
+    ) +
+    scale_x_discrete(
+      labels = name_map,
+      expand = c(0, 0)
+    ) +
+    labs(
+      x     = "Normalization method",
+      y     = paste0("miRNA (top ", topN, " by RPM)"),
+      title = "Per-miRNA monotonic trend"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 6),
+      panel.grid   = element_blank()
+    )
+  
+  pdf(paste0(plot_dir, "top100.pdf"), width = 8, height = 10)
+  print(gg)  
+  dev.off()
+  
+  # interactive heatmap
+  # Recompute the top 100 miRNAs by RPM
+  rpm_key     <- grep("RPM", names(list_of_transformations), value = TRUE)[1]
+  rpm_grp     <- geometric_mean_by_group(list_of_transformations[[rpm_key]], groups)
+  average_RPM <- rowMeans(rpm_grp)
+  top100      <- names(sort(average_RPM, decreasing = TRUE))[1:100]
+  
+  # Build a long df with monotonicity + expression text
+  mono_list <- lapply(names(list_of_transformations), function(key) {
+    grp     <- geometric_mean_by_group(list_of_transformations[[key]], groups)
+    grp100  <- grp[top100, , drop = FALSE]
+    mono    <- apply(grp100, 1, check_monotonicity)
+    # pack all group‐means into one tooltip string per miRNA
+    expr_txt <- apply(grp100, 1, function(vals) {
+      paste0(names(vals), ": ", round(vals, 2), collapse = "\n")
+    })
+    data.frame(
+      miRNA          = rownames(grp100),
+      transformation = key,
+      monotonicity   = mono,
+      expr_text      = expr_txt,
+      stringsAsFactors = FALSE
+    )
+  })
+  heat_df <- bind_rows(mono_list) %>%
+    mutate(
+      miRNA          = factor(miRNA, levels = top100),
+      transformation = factor(transformation, levels = names(colour_map)),
+      # build the full hover text
+      tooltip = paste0(
+        "miRNA: ", miRNA, "\n",
+        "Method: ", name_map[transformation], "\n",
+        "Trend: ", monotonicity, "\n\n",
+        expr_text
+      )
+    )
+  
+  # Static ggplot with text aesthetic
+  p <- ggplot(heat_df,
+              aes(x = transformation,
+                  y = miRNA,
+                  fill = monotonicity,
+                  text = tooltip)) +
+    geom_tile(color = "white", size = 0.2) +
+    scale_fill_manual(
+      name   = "Trend",
+      values = c(increasing = "#1b9e77",
+                 decreasing = "#d95f02",
+                 none       = "#FFFFFF"),
+      labels = c(increasing = "Increasing",
+                 decreasing = "Decreasing",
+                 none       = "Non-monotonic")
+    ) +
+    scale_x_discrete(labels = name_map, expand = c(0, 0)) +
+    labs(x = "Normalization method",
+         y = "miRNA (top 100 by RPM)",
+         title = "Per-miRNA monotonic trend") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 6),
+      panel.grid   = element_blank()
+    )
+  
+  # Turn it interactive and save as HTML
+  interactive_heatmap <- ggplotly(p, tooltip = "text")
+  saveWidget(interactive_heatmap,
+             file          =  paste0(plot_dir, "interactive_heatmap.html"),
+             selfcontained = TRUE)
+  
 }
 
-gg <- ggplot(final_results, aes(x = top_n, y = percentage_agreement, 
-                                color = transformation, shape = transformation_group ) ) +
-  geom_line() +
-  geom_point() +
-  # scale_x_log10() +  # Optional: Log scale for top_n
-  labs(x = "Top n miRNAs (expression)", y = "Percentage Monotonic (%)", 
-       title = "") +
+
+if (FALSE) {
+    RAW_DF     <- rpm_grp
+    
+    # pick top100 by RPM
+    topN   <- 100
+    top100 <- names(sort(average_RPM, decreasing = TRUE))[1:topN]
+    
+    # monotonicity for each normalization
+    mono_list <- lapply(names(list_of_transformations), function(key) {
+      grp100 <- geometric_mean_by_group(list_of_transformations[[key]], groups)[ top100, , drop = FALSE ]
+      data.frame(
+        miRNA          = rownames(grp100),
+        transformation = key,
+        monotonicity   = apply(grp100, 1, check_monotonicity),
+        stringsAsFactors = FALSE
+      )
+    })
+    heat_df <- bind_rows(mono_list)
+    
+    # compute log2FC and turn into the same categorical trend
+    idx    <- match(top100, rownames(RAW_DF))
+    fc_vec <- log2(RAW_DF[idx, "100S"] / RAW_DF[idx, "0S"])
+    fc_df  <- data.frame(
+      miRNA          = top100,
+      transformation = "log2FC",
+      monotonicity   = ifelse(
+        fc_vec >  0, "increasing",
+        ifelse(fc_vec <  0, "decreasing", "none")
+      ),
+      stringsAsFactors = FALSE
+    )
+    heat_df <- bind_rows(heat_df, fc_df)
+    
+    # set factor levels (so log2FC appears last)
+    heat_df <- heat_df %>%
+      mutate(
+        miRNA          = factor(miRNA, levels = top100),
+        transformation = factor(
+          transformation,
+          levels = c(names(colour_map), "log2FC")
+        )
+      )
+    
+    # single‐scale heatmap
+    gg <- ggplot(heat_df, aes(transformation, miRNA, fill = monotonicity)) +
+      geom_tile(color = "white", linewidth = 0.2) +
+      scale_fill_manual(
+        name   = "Trend",
+        values = c(
+          increasing = "#1b9e77",
+          decreasing = "#d95f02",
+          none       = "#FFFF00"
+        ),
+        labels   = c(
+          increasing = "Increasing",
+          decreasing = "Decreasing",
+          none       = "Non-monotonic"
+        ),
+        na.value = "white"
+      ) +
+      scale_x_discrete(
+        labels = c(name_map, log2FC = "log₂FC"),
+        expand = c(0, 0)
+      ) +
+      labs(
+        x     = "Normalization method",
+        y     = paste0("miRNA (top ", topN, " by RPM)"),
+        title = "Per-miRNA monotonic trend + log₂FC"
+      ) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 6),
+        panel.grid.major = element_line(color = "black")
+      )
+    
+    
+    pdf(paste0(plot_dir, "top100_wFC.pdf"), width = 8, height = 10)
+    print(gg)
+    dev.off()
+    
+  }
   
-  theme_minimal()
+# heatmap with FC between pure groups
+generate_monotonic_heatmap(
+  list_of_transformations,
+  groups,
+  rpm_grp,
+  name_map,
+  plot_dir
+)
 
-pdf(paste0(plot_dir, "percentage_monotonic_expres_rlog.pdf"), width = 8, height = 6)
-print(gg) 
-dev.off()  
+tissue_specific <- c ("mmu-miR-192-5p", "mmu-miR-142a-5p", "mmu-miR-146a-5p")
 
-gg <- ggplot(final_log2, aes(x = top_n, y = percentage_agreement, 
-                             color = transformation, shape = transformation_group ) ) +
-  geom_line() +
-  geom_point() +
-  # scale_x_log10() +  # Optional: Log scale for top_n
-  labs(x = "Top n miRNAs (absolute log2FC)", y = "Percentage Monotonic (%)", 
-       title = "percentage of monotonic expression of the top DE miRNAs using rlog") +
-  theme_minimal()
+for (mir in tissue_specific){
+  generate_correlation_heatmap(
+    list_of_transformations,
+    groups,
+    rpm_grp,
+    name_map,
+    plot_dir,
+    mir
+  )
+}
 
-pdf(paste0(plot_dir, "percentage_monotonic_log2FC_rlog.pdf"), width = 8, height = 6)
-print(gg)  
-dev.off() 
+
+
+quit()
+
+# AFTER THIS QUIT, IT'S OLD STUFF OR TESTS
+
+
+# heatmap of correlations to tissue specific miRNAs
+# markers <- c("mmu-miR-143-3p", "mmu-miR-192-5p", "mmu-miR-122-5p",
+# "mmu-miR-142a-3p", "mmu-miR-142a-5p", "mmu-miR-194-5p",
+# "mmu-miR-101b-3p", "mmu-miR-146a-5p", "mmu-miR-150-5p") 
+tissue_specific <- c ("mmu-miR-192-5p", "mmu-miR-142a-5p", "mmu-miR-146a-5p")
+
+
+
+
+
+quit()
+
+
+if (TRUE) {
+  # 1. Identify RPM and pick top 100 miRNAs
+  rpm_key     <- grep("RPM", names(list_of_transformations), value = TRUE)[1]
+  rpm_grp     <- geometric_mean_by_group(list_of_transformations[[rpm_key]], groups)
+  average_RPM <- rowMeans(rpm_grp)
+  topN        <- 100
+  top100      <- names(sort(average_RPM, decreasing = TRUE))[1:topN]
+  
+  # 2. Build monotonicity for each method
+  mono_list <- lapply(names(list_of_transformations), function(key) {
+    grp     <- geometric_mean_by_group(list_of_transformations[[key]], groups)
+    grp100  <- grp[top100, , drop = FALSE]
+    mono    <- apply(grp100, 1, check_monotonicity)
+    data.frame(
+      miRNA          = rownames(grp100),
+      transformation = key,
+      monotonicity   = mono,
+      stringsAsFactors = FALSE
+    )
+  })
+  heat_df <- bind_rows(mono_list)
+  
+  # 3. Compute log2FC between two raw‐counts columns and categorise
+  #    — placeholders RAW_DF, "COL_A", "COL_B"
+  
+  RAW_DF <- rpm_grp  
+  # Compute log2FC from two raw columns (placeholders RAW_DF, COL_A, COL_B)
+  # Ensure miRNA names align to top100 order
+  fc_vec <- log2(
+    RAW_DF[top100, "100S", drop = TRUE] /
+      RAW_DF[top100, "0S" , drop = TRUE]
+  )
+  
+  
+  fc_df <- data.frame(
+    miRNA          = top100,
+    transformation = "log2FC",
+    monotonicity   = ifelse(
+      fc_vec > 0, "increasing",
+      ifelse(fc_vec < 0, "decreasing", "none")
+    ),
+    stringsAsFactors = FALSE
+  )
+  heat_df <- bind_rows(heat_df, fc_df)
+  
+  # 4. Fix factor levels so the x-axis order includes log2FC last
+  heat_df <- heat_df %>%
+    mutate(
+      miRNA          = factor(miRNA, levels = top100),
+      transformation = factor(
+        transformation,
+        levels = c(names(colour_map), "log2FC")
+      )
+    )
+  
+  # 5. Plot single‐scale heatmap
+  gg <- ggplot(heat_df, aes(x = transformation, y = miRNA, fill = monotonicity)) +
+    geom_tile() +
+    # geom_tile(color = "black", linewidth = 0.2) +
+    # geom_tile(color = "white", linewidth = 0.2) +
+    scale_fill_manual(
+      name   = "Trend",
+      values = c(
+        increasing = "#1b9e77",
+        decreasing = "#d95f02",
+        none       = "#FFFF00"
+      ),
+      labels   = c(
+        increasing = "Increasing",
+        decreasing = "Decreasing",
+        none       = "Non-monotonic"
+      ),
+      na.value = "white"
+    ) +
+    scale_x_discrete(
+      labels = c(name_map, log2FC = "log₂FC"),
+      expand = c(0, 0)
+    ) +
+    labs(
+      x     = "Normalization method",
+      y     = paste0("miRNA (top ", topN, " by RPM)"),
+      title = "Per-miRNA monotonic trend + log₂FC"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 6),
+      # panel.grid   = element_blank()
+    )
+  
+  # 6. Save
+  pdf(paste0(plot_dir, "top100_with_fc.pdf"), width = 8, height = 10)
+  print(gg)
+  dev.off()
+}
+
+# interactive heatmap
+if (FALSE){
+  library(conflicted)
+  conflicts_prefer(plotly::layout)
+  
+  # 0. libraries
+  library(dplyr)
+  library(tidyr)
+  library(plotly)
+  library(crosstalk)
+  library(htmlwidgets)
+  
+  # 1. define human labels and colours (adjust to your palette)
+  name_map <- c(
+    RC                      = "Raw read count",
+    RPM                     = "RPM",
+    `edgeR-TMM`             = "edgeR TMM",
+    `DESeq2-rlog_mean`      = "DESeq2 rlog (mean)",
+    `DESeq2-rlog_parametric`= "DESeq2 rlog (parametric)",
+    `DESeq2-vst_local`      = "DESeq2 VST (local)"
+  )
+  colour_map <- c(
+    RC                      = "#E69F00",
+    RPM                     = "#56B4E9",
+    `edgeR-TMM`             = "#009E73",
+    `DESeq2-rlog_mean`      = "#F0E442",
+    `DESeq2-rlog_parametric`= "#0072B2",
+    `DESeq2-vst_local`      = "#D55E00"
+  )
+  
+  # 2. pick top100 by average RPM
+  rpm_key   <- grep("RPM", names(list_of_transformations), value=TRUE)[1]
+  rpm_grp   <- geometric_mean_by_group(list_of_transformations[[rpm_key]], groups)
+  top100    <- names(sort(rowMeans(rpm_grp), decreasing=TRUE))[1:100]
+  
+  # 3. build heatmap data frame
+  heat_df <- lapply(names(list_of_transformations), function(key) {
+    grp100 <- geometric_mean_by_group(list_of_transformations[[key]], groups)[top100, , drop=FALSE]
+    mono   <- apply(grp100, 1, check_monotonicity)
+    expr   <- apply(grp100, 1, function(v) paste0(names(v), ": ", round(v,2), collapse="\n"))
+    data.frame(
+      miRNA          = rownames(grp100),
+      transformation = key,
+      monotonicity   = mono,
+      tooltip        = paste0(
+        "miRNA: ", rownames(grp100), "\n",
+        "Method: ", name_map[key], "\n",
+        "Trend: ", mono, "\n\n",
+        expr
+      ),
+      cell_id = paste(rownames(grp100), key, sep=" | "),
+      stringsAsFactors=FALSE
+    )
+  }) %>% bind_rows() %>%
+    mutate(
+      miRNA          = factor(miRNA, levels=top100),
+      transformation = factor(transformation, levels=names(name_map))
+    )
+  
+  # 4. build long data for dot-plot
+  long_df <- lapply(names(list_of_transformations), function(key) {
+    grp100 <- geometric_mean_by_group(list_of_transformations[[key]], groups)[top100, , drop=FALSE]
+    df     <- as.data.frame(grp100)
+    df$miRNA          <- rownames(df)
+    df$transformation <- key
+    pivot_longer(df,
+                 cols = -c(miRNA, transformation),
+                 names_to  = "group",
+                 values_to = "value"
+    ) %>% mutate(cell_id = paste(miRNA, transformation, sep=" | "))
+  }) %>% bind_rows()
+  
+  # 5. wrap in SharedData
+  sd <- SharedData$new(long_df, key=~cell_id)
+  
+  # 6. heatmap as a grid of squares
+  p_heat <- plot_ly(
+    sd,
+    x        = ~transformation,
+    y        = ~miRNA,
+    color    = ~monotonicity,
+    colors   = colour_map,
+    type     = "scatter",
+    mode     = "markers",
+    key      = ~cell_id,
+    hoverinfo= "text",
+    text     = ~tooltip,
+    marker   = list(
+      symbol = "square",
+      size   = 20,
+      line   = list(color="white", width=1)
+    )
+  ) %>%
+    layout(
+      xaxis = list(
+        title     = "Normalization method",
+        tickangle = 45,
+        tickmode  = "array",
+        tickvals  = levels(heat_df$transformation),
+        ticktext  = name_map
+      ),
+      yaxis = list(
+        title    = "miRNA (top 100 by RPM)",
+        autorange= "reversed"
+      )
+    ) %>%
+    highlight(on        = "plotly_click",
+              off       = "plotly_doubleclick",
+              selectize = FALSE)
+  
+  # 7. dot-plot that auto-filters by the same key
+  p_dot <- plot_ly(
+    sd,
+    x        = ~group,
+    y        = ~value,
+    type     = "scatter",
+    mode     = "markers+lines",
+    marker   = list(size=8),
+    line     = list(shape="linear"),
+    hoverinfo= "text",
+    text     = ~paste0("Group: ", group, "<br>Value: ", round(value,2))
+  ) %>%
+    layout(
+      xaxis = list(title="Group"),
+      yaxis = list(title="Mean expression")
+    )
+  
+  # 8. combine and save
+  fig <- subplot(p_heat, p_dot, widths=c(0.7,0.3), shareY=FALSE) %>%
+    plotly::layout(title="Heatmap ↔ Linked dot-plot")
+  
+  saveWidget(fig,
+             file          =  paste0(plot_dir, "interactive_heatmap_with_dotplot.html"),
+             selfcontained = TRUE)
+  
+}
+
+# facet scatter
+if (TRUE){
+  top20 <- top100
+  sample_vec <- unlist(groups, use.names = FALSE)
+  group_vec  <- rep(names(groups), lengths(groups))
+  # Now:
+  #   sample_vec[i] is a sample name
+  #   group_vec[i] is the corresponding group label (the list‐element name)
+  
+  sample_to_group_df <- data.frame(
+    sample = sample_vec,
+    group  = group_vec,
+    stringsAsFactors = FALSE
+  )
+  
+  sample_to_group_df$mouse <- as.numeric(
+    sub(".*?([0-9]+)(S|L).*", "\\1", sample_to_group_df$sample)
+  ) 
+  
+  # ──────── STEP 2: Build a “long” table of sample‐level values for the top20 miRNAs ────────
+  # We'll loop over each normalization method, subset to top20, pivot longer, and join group info.
+  
+  long_list <- lapply(names(list_of_transformations), function(method_key) {
+    mat <- list_of_transformations[[method_key]]
+    
+    # Subset to the top‐20 miRNAs
+    mat20 <- mat[top20, , drop = FALSE]
+    
+    # Convert to a data.frame and pivot longer
+    df <- as.data.frame(mat20)
+    df$miRNA <- rownames(df)
+    
+    long_df <- df %>%
+      pivot_longer(
+        cols = -miRNA,
+        names_to  = "sample",
+        values_to = "value"
+      ) %>%
+      # Join on sample_to_group_df to assign group
+      left_join(sample_to_group_df, by = "sample") %>%
+      mutate(
+        method = method_key
+      )
+    
+    long_df
+  })
+  
+  expr_long <- bind_rows(long_list) %>%
+    # Drop any sample that didn’t match a group (i.e. group == NA)
+    filter(!is.na(group)) %>%
+    mutate(
+      miRNA  = factor(miRNA, levels = top20),
+      method = factor(method, levels = names(list_of_transformations)),
+      # Enforce the exact order you want:
+      group  = factor(group,
+                      levels = c("0S", "20S", "40S", "60S", "80S", "100S"))
+    )
+  expr_long <- expr_long %>%
+    mutate(
+      mouse = factor(mouse)   # *** ADDED ***
+    )
+  
+  # ──────── STEP 3: Open a multi‐page PDF device ────────
+  pdf(
+    # file   = paste0(plot_dir, "top20_scatter_by_method.pdf"),
+    file   = paste0(plot_dir, "top100_scatter_by_method.pdf"),
+    width  = 8,
+    height = 6
+  )
+  
+  # ──────── STEP 4: Loop over each miRNA and draw the facetted plot ────────
+  
+  for (mir in top20) {
+    df_sub <- filter(expr_long, miRNA == mir)
+    
+    summ_df <- df_sub %>%
+      group_by(method, group) %>%
+      summarise(
+        mean_val = mean(value),                    # arithmetic mean
+        geo_mean = exp(mean(log(value))),          # geometric mean
+        geo_trim = {                               # geo mean without furthest point
+          vals    <- value
+          drop_i  <- which.max(abs(vals - mean(vals)))
+          exp(mean(log(vals[-drop_i])))
+        },
+        .groups = "drop"
+      )
+    
+    p <- ggplot(df_sub, aes(x = group,  group = mouse, y = value, color = mouse)
+) +
+    # p <- ggplot(df_sub, aes(x = group, y = value)) +
+      # geom_boxplot(outlier.shape = NA) +
+      geom_line(alpha = 0.8, size = 0.7) +
+      
+      # ─── summary “step” markers ───
+      geom_point(
+        data  = summ_df,
+        aes(x = group, y = mean_val),
+        inherit.aes = FALSE,
+        shape  = 45,    # horizontal bar
+        size   = 6,
+        color  = "black"
+      ) +  # *** ADDED: arithmetic mean marker ***
+      geom_point(
+        data  = summ_df,
+        aes(x = group, y = geo_mean),
+        shape  = 95,
+        size   = 6,
+        inherit.aes = FALSE,
+        color  = "darkgreen"
+      ) +  # *** ADDED: geometric mean marker ***
+      geom_point(
+        data  = summ_df,
+        aes(x = group, y = geo_trim),
+        shape  = 95,
+        size   = 6,
+        inherit.aes = FALSE,
+        color  = "darkorange"
+      ) +  # *** ADDED: trimmed geometric mean marker ***
+      
+      # geom_jitter(width = 0.2, alpha = 0.6, size = 1) +
+      scale_color_brewer(palette = "Set1") +
+      geom_point(size = 2) +
+      facet_wrap(~ method, ncol = 3, 
+                 scales = "free_y") +
+      # scale_x_discrete(drop = FALSE) +   # ensure every named group appears on each facet
+      labs(
+        title = paste0(mir, "– expression by method"),
+        x     = "Transformation",
+        y     = "Expression value"
+      ) +
+      theme_minimal() +
+      theme(
+        strip.text       = element_text(size = 8),
+        axis.text.x      = element_text(angle = 45, hjust = 1),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank()
+      )
+    
+    print(p)
+  }
+  
+  dev.off()
+  
+  
+}
 
 
 # MA plot for each transformation (dot per feature)
@@ -656,29 +1357,51 @@ if (TRUE){
   
 }
 
-# TODO add levels with order
+order_levels <- cum_result %>%
+  group_by(transformation) %>%
+  slice_max(order_by = A, n = 1, with_ties = FALSE) %>%
+  arrange(desc(sd_M)) %>%
+  pull(transformation)
 
+# print(length(order_levels))
+# print(length(name_map))
+# quit()
 gg <- ggplot(cum_result, aes(x = A , y = sd_M, color = transformation, linetype = transformation)) +
   # gg <- ggplot(plot_df, aes(x = A, y = M)) +
   geom_line() +
-  scale_linetype_manual(values = line_type_mapping) +
-  theme_minimal() +  # Applies a clean theme
+  scale_linetype_manual(values = line_type_mapping,
+                        labels = name_map,
+                        breaks = order_levels
+                        ) +
+  scale_colour_manual(
+    name   = "Normalization method",
+    values = colour_map,
+    breaks = order_levels,
+    labels = name_map
+  ) +
+  scale_linetype_manual(
+    name   = "Normalization method",
+    values = line_type_mapping,
+    breaks = order_levels,
+    labels = name_map
+  ) +
+  theme_minimal() + 
   labs(
-    title = paste0("moving sd of M|A"),
-    x = "A",
-    y = "sd(M|A)"
+    title = paste0(""),
+    x = "Average expression",
+    y = "sd(log2FC)"
   )
+
 pdf(paste0(plot_dir, "sd_mean_plot.pdf"), width = 8, height = 6)
 print(gg)  
 dev.off()  
-
 
 ##
 ### O/E values  
 ##
 ##
 
-RPM_threshold <- 50
+RPM_threshold <- minRPM
 
 if (TRUE){
   # for loop that iterates all transformations
@@ -703,17 +1426,6 @@ if (TRUE){
     temp_df <- temp_df[rownames(temp_df) %in% over50_miRNAs, ]
     group_df <- group_df[rownames(group_df) %in% over50_miRNAs, ]
     recalculated_df <- data.frame(matrix(nrow = nrow(temp_df), ncol = ncol(temp_df)))
-    
-    # print("")
-    # print(key_name)
-    # print(dim(temp_df))
-    # print(dim(group_df))
-    # print(dim(recalculated_df))
-    # # print(head(temp_df))
-    # # print(head(group_df))
-    # # print(head(recalculated_df))
-    # print("")
-    
     colnames(recalculated_df) <- colnames(temp_df)
     columns_to_drop <- c()
     for (i in seq_along(colnames(temp_df))) {
@@ -781,7 +1493,7 @@ gg <- ggplot(plot_df, aes(x = transformation, y = ObservedExpectedRatio)) +
   theme_minimal() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
-ggsave(paste0(plot_dir, "log_OE.pdf"), plot = gg, width = 20, height = 11.25, device = "pdf")
+ggsave(paste0(plot_dir, "log_OE.pdf"), plot = gg, width = 8, height = 6, device = "pdf")
 
 # O/E values predicted per sample using source mouse data
 # for loop that iterates all transformations
@@ -801,7 +1513,6 @@ if (TRUE){
     temp_df <- list_of_transformations[[i]]
     temp_df <- temp_df[rownames(temp_df) %in% over50_miRNAs, ]
     temp_df <- temp_df[, relevant_columns]
-    
     mouse_recalculated_df <- data.frame(matrix(nrow = nrow(temp_df), ncol = 0))
     rownames(mouse_recalculated_df) <- rownames(temp_df)  # Set row names to match filtered_df
     # recalculated_df <- data.frame(matrix(nrow = nrow(temp_df), ncol = ncol(temp_df)))
@@ -861,862 +1572,44 @@ if (TRUE){
   
 }
 
-gg <- ggplot(plot_df, aes(x = transformation, y = ObservedExpectedRatio)) +
-  geom_boxplot() +  # Boxplot without displaying outliers
-  # geom_jitter() +  
-  geom_hline(yintercept = 1, linetype = "dashed", color = "blue") +
-  labs(x = "transformtion", y = "Observed/Expected Ratio") +
-  ggtitle("Observed/Expected Ratio") +
-  # scale_y_continuous(breaks = seq(0, max_y, by = 1)) +  # Add y-axis ticks at every unit
-  # scale_y_continuous() +  # Add y-axis ticks at every unit
-  scale_y_log10()+
+gg <- ggplot(plot_df,
+             aes(x = transformation,
+                 y = ObservedExpectedRatio,
+                 fill = transformation)) +
+  geom_boxplot(alpha = 0.8) +                # show.legend defaults to TRUE
+  guides(alpha = "none") +
+  geom_hline(yintercept = 1,
+             linetype = "dashed",
+             color = "blue") +
+  scale_y_log10() +
+  
+  # apply your human-readable names on the x-axis
+  scale_x_discrete(
+    labels = name_map
+  ) +
+  
+  # manual fill scale with your fixed colours and labels
+  scale_fill_manual(
+    name   = "normalization method",
+    values = colour_map,
+    labels = name_map
+  ) +
+  
   theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-ggsave(paste0(plot_dir, "log_mouse_OE.pdf"), plot = gg, width = 20, height = 11.25, device = "pdf")
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Observed/Expected Ratio"
+  )
 
-
-### OLD STUFF
-
-
-for (i in seq_along(group_prefixes)) {
-  prefix <- group_prefixes[i]
-  percentage <- percentages[i]
-  remaining_percentage <- remaining_percentages[i]
-  
-  # Select columns that start with the current prefix
-  selected_columns <- grep(paste0("^", prefix), colnames(recalculated_df), value = TRUE)
-  
-  # Loop through the selected columns and extract the corresponding mouse identifiers
-  for (col in selected_columns) {
-    # Extract the mouse identifier, which is located between the prefix and the "S" or "L" part
-    mouse_id <- sub(paste0("^", prefix, "_(\\d+)[SL]_.*"), "\\1", col)  # Extracts the mouse number
-    
-    # Define the corresponding "S" and "L" columns using the extracted mouse ID
-    S_column <- paste0(mouse_id, "S")
-    L_column <- paste0(mouse_id, "L")
-    
-    # Check if both corresponding columns (e.g., 1S and 1L) exist in filtered_df
-    if (S_column %in% colnames(temp_df) && L_column %in% colnames(temp_df)) {
-      # Calculate the weighted value for each row
-      recalculated_values <- (percentage * filtered_df[[S_column]]) + (remaining_percentage * filtered_df[[L_column]])
-      
-      # Add the recalculated values as a new column in mouse_recalculated_df
-      mouse_recalculated_df[[col]] <- recalculated_values
-    }
-  }
-}
-
-if (FALSE){
-  # O/E ratio
-  OE_ratio <- filtered_df/recalculated_df
-  miRNAs_over_50 <- names(average_RPM[average_RPM > 50])
-  temp_OE_ratio <- OE_ratio
-  temp_OE_ratio$miRNA <- rownames(temp_OE_ratio)
-  temp_OE_ratio <- subset(temp_OE_ratio, miRNA %in% miRNAs_over_50)
-  long_ratio_data <- melt(temp_OE_ratio, id.vars = "miRNA", variable.name = "Sample", value.name = "ObservedExpectedRatio")
-  long_ratio_data$miRNA <- factor(long_ratio_data$miRNA, levels = miRNAs_over_50[order(average_RPM[miRNAs_over_50])])
-  
-  max_y <- ceiling(max(long_ratio_data$ObservedExpectedRatio))
-  
-  # Create the boxplot with custom hover text for individual points
-  gg <- ggplot(long_ratio_data, aes(x = miRNA, y = ObservedExpectedRatio)) +
-    geom_boxplot(outlier.shape = NA) +  # Boxplot without displaying outliers
-    geom_jitter(aes(text = paste("miRNA:", miRNA, 
-                                 "<br>Sample:", Sample, 
-                                 "<br>Observed/Expected Ratio:", round(ObservedExpectedRatio, 2))), 
-                width = 0.2, size = 0.5, color = "blue") +  # Smaller jittered points with hover text
-    labs(x = "miRNA", y = "Observed/Expected Ratio") +
-    ggtitle("Observed/Expected Ratio per miRNA (Filtered by RPM > 50)") +
-    scale_y_continuous(breaks = seq(0, max_y, by = 1)) +  # Add y-axis ticks at every unit
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  
-  # Create the boxplot with a log-scaled y-axis
-  
-  group_data_with_status <- as.data.frame(group_data_with_status)
-  long_ratio_data$expected_direction <- group_data_with_status$monotonicity[match(long_ratio_data$miRNA, rownames(group_data_with_status))]
-  
-  
-  gg <- ggplot(long_ratio_data, aes(x = miRNA, y = ObservedExpectedRatio, color = expected_direction)) +
-    geom_boxplot(outlier.shape = NA) +  # Boxplot without displaying outliers
-    geom_jitter(aes(text = paste("miRNA:", miRNA, 
-                                 "<br>Sample:", Sample, 
-                                 "<br>Observed/Expected Ratio:", round(ObservedExpectedRatio, 2))), 
-                width = 0.2, size = 0.5, color = "blue") +  # Smaller jittered points with hover text
-    geom_hline(yintercept = 1, linetype = "dashed", color = "red", size = 1) +  # Add thick dashed line at y = 1
-    labs(x = "miRNA", y = "Observed/Expected Ratio (log scale)") +
-    ggtitle("Observed/Expected Ratio per miRNA (Filtered by RPM > 50)") +
-    scale_y_log10(breaks = scales::log_breaks(base = 10)) +  # Apply log10 scale with base-10 breaks
-    scale_color_manual(values = c("increasing" = "green", "decreasing" = "orange", "neither" = "black")) +  # Custom colors
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  
-  ggsave("/Users/ernesto/PycharmProjects/miRNA_reference/meetings/meetings_plots/observed_expected_ratio_plot.pdf", plot = gg, width = 20, height = 11.25, device = "pdf")
-  
-  # Convert to plotly with custom hover text
-  ggplotly(gg, tooltip = "text")
-  
-  # boxplot each sample
-  long_ratio_data$SampleGroup <- sapply(long_ratio_data$Sample, function(sample) {
-    group_name <- names(groups)[sapply(groups, function(g) sample %in% g)]
-    if (length(group_name) > 0) return(group_name) else return(NA)
-  })
-  
-  gg <- ggplot(long_ratio_data, aes(x = Sample, y = ObservedExpectedRatio)) +
-    geom_boxplot(outlier.shape = NA, alpha = 0.5) +  # Boxplot with reduced transparency
-    geom_jitter(aes(text = paste("Sample:", Sample, 
-                                 "<br>miRNA:", miRNA, 
-                                 "<br>Observed/Expected Ratio:", round(ObservedExpectedRatio, 2))), 
-                width = 0.2, size = 0.5, color = "blue") +  # Jittered points with custom hover info
-    labs(x = "Sample", y = "Observed/Expected Ratio (Log Scale)") +
-    ggtitle("Observed/Expected Ratio per Sample, Grouped by Sample Group") +
-    scale_y_log10() +  # Set y-axis to logarithmic scale
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-    facet_wrap(~ SampleGroup, scales = "free_x")  # Facet by sample group
-  
-  ggsave("/Users/ernesto/PycharmProjects/miRNA_reference/meetings/meetings_plots/observed_expected_ratio_per_sample.pdf", plot = gg, width = 10, height = 5.65, device = "pdf")
-  
-  ggplotly(gg, tooltip = "text")
-  
-  
-  gg <- ggplot(long_ratio_data, aes(x = Sample, y = ObservedExpectedRatio)) +
-    geom_boxplot(outlier.shape = NA, alpha = 0.5) +  # Boxplot with reduced transparency
-    geom_jitter(aes(text = paste("Sample:", Sample, 
-                                 "<br>miRNA:", miRNA, 
-                                 "<br>Observed/Expected Ratio:", round(ObservedExpectedRatio, 2))), 
-                width = 0.2, size = 0.5, color = "blue") +  # Jittered points with custom hover info
-    labs(x = "Sample", y = "Observed/Expected Ratio") +
-    ggtitle("Observed/Expected Ratio per Sample") +
-    scale_y_continuous(breaks = seq(0, max_y, by = 1)) +  # Add y-axis ticks at every unit
-    theme_minimal() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-}
-
-if (FALSE){
-  # Get the relevant columns for the groups 0S to 100S
-  columns_order <- c("0S", "20S", "40S", "60S", "80S", "100S")
-  group_data <- group_avg_RPM[, columns_order]
-  # monotonicity_status <- apply(group_data, 1, check_monotonicity)
-  monotonicity_status <- apply(group_data, 1, check_monotonicity_lax)
-  
-  # Add the monotonicity status as a new column in the matrix
-  # group_data <- cbind(group_data, monotonicity = monotonicity_status)
-  group_data <- data.frame(group_data, monotonicity = monotonicity_status)
-}
+ggsave(paste0(plot_dir, "log_mouse_OE.pdf"), plot = gg, width = 8, height = 6, device = "pdf")
 
 quit()
+
 
 #### TO ADD
 
 # constant miRNAs?
 # iteratively remove miRNAs (especially high) and check if this norm improves
-
-
-library(tidyverse)
-library(reshape2)
-library(ggplot2)
-
-## decide ground truth (spleen vs liver adj p-val < 0.01)
-# load edgeR and DESeq liver vs spleen matrix
-
-DESeq_matrix <- read.csv("~/PycharmProjects/miRNA_reference/pairwise_DE_results/DESeq/pure_liver_VS_pure_spleen/DESeq.tsv", row.names=1)
-edgeR_matrix <- read.delim("~/PycharmProjects/miRNA_reference/pairwise_DE_results/edgeR/pure_liver_VS_pure_spleen/edgeR.tsv", row.names=1)
-
-
-# filter out everything below 50 avg RPM
-
-
-
-
-
-### expected increase (strong evidence)
-# logFC DESeq and edgeR > 1.5
-DESeq_DE <- rownames(DESeq_matrix[!is.na(DESeq_matrix$log2FoldChange) & DESeq_matrix$log2FoldChange > 1, ])
-edgeR_DE <- rownames(edgeR_matrix[!is.na(edgeR_matrix$logFC) & edgeR_matrix$logFC > 1, ])
-strong_increase <- intersect(DESeq_DE, edgeR_DE)
-
-# expected decrease (strong evidence)
-# logFC DESeq and edgeR < -1.5
-DESeq_DE <- rownames(DESeq_matrix[!is.na(DESeq_matrix$log2FoldChange) & DESeq_matrix$log2FoldChange < -1, ])
-edgeR_DE <- rownames(edgeR_matrix[!is.na(edgeR_matrix$logFC) & edgeR_matrix$logFC < -1, ])
-strong_decrease <- intersect(DESeq_DE, edgeR_DE)
-
-# expected increase (weaker evidence)
-# logFC DESeq or edge > 1.5 and the other > 0
-DES_0 <- rownames(DESeq_matrix[!is.na(DESeq_matrix$log2FoldChange) & DESeq_matrix$log2FoldChange > 0, ])
-edg_0 <- rownames(edgeR_matrix[!is.na(edgeR_matrix$logFC) & edgeR_matrix$logFC > 0, ])
-DES_1 <- intersect(rownames(DESeq_matrix[!is.na(DESeq_matrix$log2FoldChange) & DESeq_matrix$log2FoldChange > 1, ]), edg_0)
-edge_1 <- intersect(rownames(edgeR_matrix[!is.na(edgeR_matrix$logFC) & edgeR_matrix$logFC > 1, ]), DES_0)
-
-weaker_increase <- union(DES_1, edge_1)
-
-# expected decrease (weaker evidence)
-# logFC DESeq or edge < -1.5 and the other < 0
-DES_0 <- rownames(DESeq_matrix[!is.na(DESeq_matrix$log2FoldChange) & DESeq_matrix$log2FoldChange < 0, ])
-edg_0 <- rownames(edgeR_matrix[!is.na(edgeR_matrix$logFC) & edgeR_matrix$logFC < 0, ])
-DES_1 <- intersect(rownames(DESeq_matrix[!is.na(DESeq_matrix$log2FoldChange) & DESeq_matrix$log2FoldChange < 1, ]), edg_0)
-edge_1 <- intersect(rownames(edgeR_matrix[!is.na(edgeR_matrix$logFC) & edgeR_matrix$logFC < 1, ]), DES_0)
-
-weaker_decrease <- union(DES_1, edge_1)
-
-# make matrix per group (geometric mean)
-# load miRNA_data
-input_df <- read.delim("/Users/ernesto/PycharmProjects/miRNA_reference/de/mature_sense_minExpr0_RCadj.mat", 
-                       check.names = FALSE, row.names = 1)
-
-colnames(input_df) <- gsub("\\_R1\\|grp1", "", colnames(input_df))
-
-
-
-# define which samples belong to each group
-if (TRUE){
-  groups <- list()
-  
-  for (x in c(20, 40, 60, 80)) {
-    current_group <- as.character(x)
-    print(current_group)
-    # columns <- grep(paste0("^",current_group), colnames(input_df))
-    columns <- grep(paste0("^",current_group, "(?!.*_2$)"), colnames(input_df), perl = TRUE)
-    members <- colnames(input_df)[columns]
-    print(members)
-    groups[[paste0(current_group, "S")]] <- members
-    
-  }
-  columns <- grep("^[1-5]L(?!.*_.*_)", colnames(input_df), perl = TRUE)
-  # columns <- grep("^[1-5]L", colnames(input_df))
-  # columns <- columns[-5]
-  groups[["pure_liver"]] <- colnames(input_df)[columns]
-  
-  columns <- grep("^[1-5]S(?!.*_2$)", colnames(input_df), perl = TRUE)
-  groups[["pure_spleen"]] <- colnames(input_df)[columns]
-}
-group_list <- names(groups)
-
-# generate a matrix per group
-if (TRUE){
-  # Assuming input_df is your miRNA raw count matrix with columns as sample names
-  
-  # Initialize an empty list to store RPM data per group
-  group_RPMs <- list()
-  
-  # Function to normalize to RPM
-  normalize_to_RPM <- function(counts_df) {
-    total_counts <- colSums(counts_df)
-    RPM <- sweep(counts_df, 2, total_counts, FUN = "/") * 1e6
-    return(RPM)
-  }
-  
-  # Add 1 to raw counts to avoid log(0)
-  input_df <- input_df + 1
-  
-  # Normalize each group to RPM
-  for (group in group_list) {
-    # Get the samples corresponding to this group
-    group_samples <- groups[[group]]
-    
-    # Subset the input_df to only the columns corresponding to this group
-    group_df <- input_df[, group_samples]
-    
-    # Normalize to RPM
-    group_RPM <- normalize_to_RPM(group_df)
-    
-    # Store the RPM values for this group
-    group_RPMs[[group]] <- group_RPM
-  }
-  
-  # Initialize an empty matrix to store the average RPMs
-  group_avg_RPM <- matrix(NA, nrow = nrow(input_df), ncol = length(group_list))
-  rownames(group_avg_RPM) <- rownames(input_df)
-  colnames(group_avg_RPM) <- group_list
-  
-  # Calculate the geometric mean for each group and store in the matrix
-  for (group in group_list) {
-    # Extract the RPM data for this group
-    group_RPM <- group_RPMs[[group]]
-    
-    # Calculate the geometric mean for each miRNA (log space, then exponentiate)
-    log_RPM <- log2(group_RPM)
-    log_means <- rowMeans(log_RPM)
-    group_avg_RPM[, group] <- log_means
-  }
-  
-  # Exponentiate to get the geometric means back in the original scale (if needed)
-  group_avg_RPM <- 2 ^ group_avg_RPM
-  
-}
-
-colnames(group_avg_RPM) [5:6] <- c("0S", "100S")
-
-## monotonic function
-
-check_monotonicity <- function(x) {
-  if (all(diff(x) > 0)) {
-    return("increasing")
-  } else if (all(diff(x) < 0)) {
-    return("decreasing")
-  } else {
-    return("neither")
-  }
-}
-
-check_monotonicity_lax <- function(x) {
-  if (all(diff(x) >= 0)) {
-    return("increasing")
-  } else if (all(diff(x) <= 0)) {
-    return("decreasing")
-  } else {
-    return("neither")
-  }
-}
-
-## check monotonic trend
-
-if (TRUE){
-  # Get the relevant columns for the groups 0S to 100S
-  columns_order <- c("0S", "20S", "40S", "60S", "80S", "100S")
-  group_data <- group_avg_RPM[, columns_order]
-  # monotonicity_status <- apply(group_data, 1, check_monotonicity)
-  monotonicity_status <- apply(group_data, 1, check_monotonicity_lax)
-  
-  # Add the monotonicity status as a new column in the matrix
-  # group_data <- cbind(group_data, monotonicity = monotonicity_status)
-  group_data <- data.frame(group_data, monotonicity = monotonicity_status)
-}
-
-## calculate percentages of correct recall in trend
-if (TRUE){
-  increase_status <- monotonicity_status[rownames(group_data) %in% strong_increase]
-  decrease_status <- monotonicity_status[rownames(group_data) %in% strong_decrease]
-  
-  # 2. Calculate how many are correctly classified
-  correct_increase <- sum(increase_status == "increasing")
-  correct_decrease <- sum(decrease_status == "decreasing")
-  
-  # 3. Calculate the total number of miRNAs in each set
-  total_increase <- length(strong_increase)
-  total_decrease <- length(strong_decrease)
-  
-  # 4. Calculate percentages
-  percent_increase_correct <- (correct_increase / total_increase) * 100
-  percent_decrease_correct <- (correct_decrease / total_decrease) * 100
-  print(percent_increase_correct)
-  print(percent_decrease_correct)
-}
-
-## calculate percentages of correct recall in trend (weaker)
-if (TRUE){
-  increase_status <- monotonicity_status[rownames(group_data) %in% weaker_increase]
-  decrease_status <- monotonicity_status[rownames(group_data) %in% weaker_decrease]
-  
-  # 2. Calculate how many are correctly classified
-  correct_increase <- sum(increase_status == "increasing")
-  correct_decrease <- sum(decrease_status == "decreasing")
-  
-  # 3. Calculate the total number of miRNAs in each set
-  total_increase <- length(weaker_increase)
-  total_decrease <- length(weaker_decrease)
-  
-  # 4. Calculate percentages
-  percent_increase_correct <- (correct_increase / total_increase) * 100
-  percent_decrease_correct <- (correct_decrease / total_decrease) * 100
-}
-
-### sequential dot plots
-
-# Step 1: Create RPM matrix for all samples
-# Normalize input_df to RPM, adding 1 to avoid log(0) issues
-input_df <- input_df + 1
-total_counts <- colSums(input_df)
-all_samples_RPM <- sweep(input_df, 2, total_counts, FUN = "/") * 1e6
-
-# Step 2: Filter out samples that are not in any group
-# Flatten the list of groups to get all sample names within groups
-grouped_samples <- unlist(groups)
-filtered_RPM <- all_samples_RPM[, colnames(all_samples_RPM) %in% grouped_samples]
-
-# Step 3: Melt the filtered RPM matrix for ggplot compatibility
-# First, add rownames (miRNA) as a new column to preserve miRNA identifiers
-filtered_RPM$miRNA <- rownames(filtered_RPM)
-melted_RPM <- melt(filtered_RPM, id.vars = "miRNA", variable.name = "Sample", value.name = "RPM")
-
-melted_RPM$Group <- sapply(melted_RPM$Sample, function(sample) {
-  group <- names(groups)[sapply(groups, function(g) sample %in% g)]
-  if (length(group) > 0) return(group) else return(NA)
-})
-
-plot_miRNA_dots <- function(miRNA_input, melted_RPM, group_order = c("0S", "20S", "40S", "60S", "80S", "100S")) {
-  # Subset to the specified miRNA only
-  miRNA_data <- subset(melted_RPM, miRNA == miRNA_input)
-  
-  # Ensure Group is a factor for ordering in ggplot
-  miRNA_data$Group <- factor(miRNA_data$Group, levels = group_order)
-  
-  # Create the dot plot
-  # ggplot(miRNA_data, aes(x = Group, y = RPM)) +
-  ggplot(miRNA_data, aes(x = Group, y = RPM, text = paste("Sample:", Sample, "<br>RPM:", round(RPM, 2)))) +
-    geom_point(aes(color = Group), position = position_jitter(width = 0.15, height = 0), size = 2) +
-    scale_color_brewer(palette = "Dark2") +
-    ggtitle(paste("RPM values for miRNA:", miRNA_input)) +
-    xlab("Group") +
-    ylab("RPM") +
-    theme_minimal() +
-    theme(legend.position = "none")
-}
-
-# plot in theory decreasing but not actually
-# theoretical decrease strong_decrease
-# labels different than decreasing 
-failed_dec <- intersect(rownames(subset(group_data, group_data$monotonicity != "decreasing")), strong_decrease)
-
-plot_miRNA_dots("Mmu-Mir-3090_3p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-506-P18_3p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-3073-as_3p*", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-3073_3p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-3105_5p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-192-P2_3p*", melted_RPM)
-
-
-
-
-
-
-
-plot_miRNA_dots("Mmu-Mir-24-P3_5p*", melted_RPM)
-
-plot_miRNA_dots("Mmu-Mir-1948_3p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-459_3p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-194-P2_5p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-122_5p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-192-P2_5p", melted_RPM)
-plot_miRNA_dots("Mmu-Mir-148-P1_5p*", melted_RPM)
-
-
-
-### FILTER only to miRNAs 50RPM or more
-# discard all other miRNAs from all lists
-
-#miRNAs with at least 50 RPM
-
-average_RPM <- rowMeans(all_samples_RPM)
-# Get the names of miRNAs with at least 50 RPM on average
-miRNAs_above_50_RPM <- names(average_RPM[average_RPM >= 50])
-
-
-strong_increase <- intersect(strong_increase, miRNAs_above_50_RPM)
-strong_decrease <- intersect(strong_decrease, miRNAs_above_50_RPM)
-
-strong_increase_mono <- intersect(strong_increase, rownames(subset(group_data, group_data$monotonicity == "increasing")))
-strong_decrease_mono <- intersect(strong_decrease, rownames(subset(group_data, group_data$monotonicity == "decreasing")))
-
-length(strong_decrease_mono)/length(strong_decrease)
-length(strong_increase_mono)/length(strong_increase)
-
-# failing cases
-failed_dec <- intersect(rownames(subset(group_data, group_data$monotonicity != "decreasing")), strong_decrease)
-
-gg <- plot_miRNA_dots("Mmu-Mir-193-P2b_3p", melted_RPM)
-
-ggplotly(gg, tooltip = "text")
-
-failed_inc <- intersect(rownames(subset(group_data, group_data$monotonicity != "increasing")), strong_increase)
-gg <- plot_miRNA_dots("Mmu-Mir-223_3p", melted_RPM)
-ggplotly(gg, tooltip = "text")
-
-#####
-#####
-#####
-########### MIRBASE #######
-#####
-#####
-#####
-
-# DE L vs S
-
-input_df <- read.delim("/Users/ernesto/PycharmProjects/miRNA_reference/de_matrix/mirbase_MA/mature_sense_minExpr0_RCadj.mat", 
-                       check.names = FALSE, row.names = 1)
-
-colnames(input_df) <- gsub("\\_R1\\|grp1", "", colnames(input_df))
-
-# LOAD DE MATRIX
-
-DESeq_matrix <- read.csv("/Users/ernesto/PycharmProjects/miRNA_reference/DE_results/mirbase/DESeq/pure_liver_VS_pure_spleen/DESeq.tsv", row.names=1)
-edgeR_matrix <- read.delim("/Users/ernesto/PycharmProjects/miRNA_reference/DE_results/mirbase/edgeR/pure_liver_VS_pure_spleen/edgeR.tsv", row.names=1)
-
-
-# filter out everything below 50 avg RPM
-
-
-### expected increase (strong evidence)
-# logFC DESeq and edgeR > 1.5
-DESeq_DE <- rownames(DESeq_matrix[!is.na(DESeq_matrix$log2FoldChange) & DESeq_matrix$log2FoldChange > 1, ])
-edgeR_DE <- rownames(edgeR_matrix[!is.na(edgeR_matrix$logFC) & edgeR_matrix$logFC > 1, ])
-strong_increase <- intersect(DESeq_DE, edgeR_DE)
-
-# expected decrease (strong evidence)
-# logFC DESeq and edgeR < -1.5
-DESeq_DE <- rownames(DESeq_matrix[!is.na(DESeq_matrix$log2FoldChange) & DESeq_matrix$log2FoldChange < -1, ])
-edgeR_DE <- rownames(edgeR_matrix[!is.na(edgeR_matrix$logFC) & edgeR_matrix$logFC < -1, ])
-strong_decrease <- intersect(DESeq_DE, edgeR_DE)
-
-# calculate RPM, reduce only to min 50 RPM average
-
-input_df <- input_df + 1
-total_counts <- colSums(input_df)
-all_samples_RPM <- sweep(input_df, 2, total_counts, FUN = "/") * 1e6
-average_RPM <- rowMeans(all_samples_RPM)
-# Get the names of miRNAs with at least 50 RPM on average
-miRNAs_above_50_RPM <- names(average_RPM[average_RPM >= 50])
-
-# Step 2: Filter out samples that are not in any group
-# Flatten the list of groups to get all sample names within groups
-grouped_samples <- unlist(groups)
-filtered_RPM <- all_samples_RPM[, colnames(all_samples_RPM) %in% grouped_samples]
-
-
-
-## calculate monotonic
-# make group matrix
-if (TRUE){
-  # Assuming input_df is your miRNA raw count matrix with columns as sample names
-  
-  # Initialize an empty list to store RPM data per group
-  group_RPMs <- list()
-  
-  # Function to normalize to RPM
-  normalize_to_RPM <- function(counts_df) {
-    total_counts <- colSums(counts_df)
-    RPM <- sweep(counts_df, 2, total_counts, FUN = "/") * 1e6
-    return(RPM)
-  }
-  
-  # Add 1 to raw counts to avoid log(0)
-  input_df <- input_df + 1
-  
-  # Normalize each group to RPM
-  for (group in group_list) {
-    # Get the samples corresponding to this group
-    group_samples <- groups[[group]]
-    
-    # Subset the input_df to only the columns corresponding to this group
-    group_df <- input_df[, group_samples]
-    
-    # Normalize to RPM
-    group_RPM <- normalize_to_RPM(group_df)
-    
-    # Store the RPM values for this group
-    group_RPMs[[group]] <- group_RPM
-  }
-  
-  # Initialize an empty matrix to store the average RPMs
-  group_avg_RPM <- matrix(NA, nrow = nrow(input_df), ncol = length(group_list))
-  rownames(group_avg_RPM) <- rownames(input_df)
-  colnames(group_avg_RPM) <- group_list
-  
-  # Calculate the geometric mean for each group and store in the matrix
-  for (group in group_list) {
-    # Extract the RPM data for this group
-    group_RPM <- group_RPMs[[group]]
-    
-    # Calculate the geometric mean for each miRNA (log space, then exponentiate)
-    log_RPM <- log2(group_RPM)
-    log_means <- rowMeans(log_RPM)
-    group_avg_RPM[, group] <- log_means
-  }
-  
-  # Exponentiate to get the geometric means back in the original scale (if needed)
-  group_avg_RPM <- 2 ^ group_avg_RPM
-  
-}
-
-colnames(group_avg_RPM) [5:6] <- c("0S", "100S")
-columns_order <- c("0S", "20S", "40S", "60S", "80S", "100S")
-group_data <- group_avg_RPM[, columns_order]
-monotonicity_status <- apply(group_data, 1, check_monotonicity_lax)
-
-# Add the monotonicity status as a new column in the matrix
-# group_data <- cbind(group_data, monotonicity = monotonicity_status)
-group_data <- data.frame(group_data, monotonicity = monotonicity_status)
-colnames(group_data)[1:6] <- columns_order
-
-
-# overlap between expected/observed monotonic increase
-
-strong_increase <- intersect(strong_increase, miRNAs_above_50_RPM)
-strong_decrease <- intersect(strong_decrease, miRNAs_above_50_RPM)
-
-strong_increase_mono <- intersect(strong_increase, rownames(subset(group_data, group_data$monotonicity == "increasing")))
-strong_decrease_mono <- intersect(strong_decrease, rownames(subset(group_data, group_data$monotonicity == "decreasing")))
-
-length(strong_decrease_mono)/length(strong_decrease)
-length(strong_increase_mono)/length(strong_increase)
-
-
-failed_dec <- intersect(rownames(subset(group_data, group_data$monotonicity != "decreasing")), strong_decrease)
-failed_inc <- intersect(rownames(subset(group_data, group_data$monotonicity != "increasing")), strong_increase)
-# plots
-
-filtered_RPM$miRNA <- rownames(filtered_RPM)
-melted_RPM <- melt(filtered_RPM, id.vars = "miRNA", variable.name = "Sample", value.name = "RPM")
-
-melted_RPM$Group <- sapply(melted_RPM$Sample, function(sample) {
-  group <- names(groups)[sapply(groups, function(g) sample %in% g)]
-  if (length(group) > 0) return(group) else return(NA)
-})
-
-
-gg <- plot_miRNA_dots("Mmu-Mir-193-P2b_3p", melted_RPM)
-
-ggplotly(gg, tooltip = "text")
-
-
-gg <- plot_miRNA_dots("Mmu-Mir-223_3p", melted_RPM)
-ggplotly(gg, tooltip = "text")
-
-
-
-## TODO
-# try more robust filters
-
-### iterate RPM thresholds
-# build function that generates % increase and decrease for each threshold
-
-get_monotonic_perc <- function(increase, decrease, mono_matrix, RPM_average, threshold){
-  
-  thresholded_miRNAs <-  names(RPM_average[RPM_average >= threshold])
-  
-  cons_increase <- intersect(increase, thresholded_miRNAs)
-  cons_decrease <- intersect(decrease, thresholded_miRNAs)
-  
-  strong_increase_mono <- intersect(cons_increase, rownames(subset(mono_matrix, mono_matrix$monotonicity == "increasing")))
-  strong_decrease_mono <- intersect(cons_decrease, rownames(subset(mono_matrix, mono_matrix$monotonicity == "decreasing")))
-  
-  perc_inc <- length(strong_increase_mono)/length(cons_increase)
-  perc_dec <- length(strong_decrease_mono)/length(cons_decrease)
-  
-  return(c(perc_inc, perc_dec, length(strong_increase_mono), length(strong_decrease_mono)))
-}
-
-# input: strong increase, strong decrease, average RPMs, thresholds
-
-# Define thresholds to iterate over
-thresholds <- c(0:5, 10, 50, 100, 500, 1000)
-
-# Initialize an empty data frame to store results
-results_df <- data.frame()
-
-# Loop through each threshold, using your get_monotonic_perc function
-for (threshold in thresholds) {
-  # Calculate the percentages for the current threshold
-  result <- get_monotonic_perc(strong_increase, strong_decrease, group_data, average_RPM, threshold )
-  
-  # Add the results to the data frame in melted format
-  results_df <- rbind(results_df, 
-                      data.frame(threshold = threshold, direction = "increase", 
-                                 percentage = result[1], total = result[3]),
-                      data.frame(threshold = threshold, direction = "decrease", 
-                                 percentage = result[2], total = result[4]))
-}
-
-# plot in bars or lines
-
-
-
-### 1 average on each pure group
-
-if (TRUE){
-  # make average RPM matrix
-  group_data$monotonicity <- NULL
-  colnames(group_data) <- c("0S", "20S", "40S", "60S", "80S", "100S")
-  group_ass <- groups
-  names(group_ass) <- c( "20S", "40S", "60S", "80S", "0S", "100S")
-  # make expected values matrix 
-  
-  filter_df_by_group <- function(group_list, df) {
-    # Initialize a vector to store the group names for each column that is kept
-    group_vector <- c()
-    
-    # Initialize a vector to store columns that should be kept
-    columns_to_keep <- c()
-    
-    # Loop over each column in the dataframe
-    for (col in colnames(df)) {
-      # Find the group the column belongs to
-      group_found <- NULL
-      for (group_name in names(group_list)) {
-        if (col %in% group_list[[group_name]]) {
-          group_found <- group_name
-          break
-        }
-      }
-      
-      # If the column is in the list, add it to the columns to keep
-      # and add the group name to the group vector
-      if (!is.null(group_found)) {
-        columns_to_keep <- c(columns_to_keep, col)
-        group_vector <- c(group_vector, group_found)
-      }
-    }
-    
-    # Subset the dataframe to only include the columns in columns_to_keep
-    filtered_df <- df[, columns_to_keep, drop = FALSE]
-    
-    # Return the filtered dataframe and the group vector
-    list(filtered_df = filtered_df, group_vector = group_vector)
-  }
-  
-  result <- filter_df_by_group(group_ass, all_samples_RPM)
-  
-  # Extract filtered_df and group_vector from the result list
-  filtered_df <- result$filtered_df
-  group_vector <- result$group_vector
-  
-  # Check column names in summary_df to ensure they are correct
-  print("Column names in summary_df:")
-  print(colnames(group_avg_RPM_df))
-  
-  # Initialize an empty data frame to store recalculated values
-  recalculated_df <- data.frame(matrix(nrow = nrow(filtered_df), ncol = ncol(filtered_df)))
-  colnames(recalculated_df) <- colnames(filtered_df)  # Set column names to match filtered_df
-  
-  # Loop through each column in filtered_df and corresponding group in group_vector
-  for (i in seq_along(group_vector)) {
-    # Get the group name and extract the percentages
-    group_name <- group_vector[i]
-    percentage <- as.numeric(gsub("S", "", group_name)) / 100
-    remaining_percentage <- 1 - percentage
-    
-    # Print to inspect each calculated percentage and remaining percentage
-    cat("Group:", group_name, "| Percentage:", percentage * 100, "| Remaining:", remaining_percentage * 100, "\n")
-    
-    # Calculate the weighted value for each row using the columns 100S and 0S in summary_df
-    recalculated_values <- (percentage * group_avg_RPM_df[["100S"]]) + (remaining_percentage * group_avg_RPM_df[["0S"]])
-    
-    # Assign the recalculated values to the corresponding column in recalculated_df
-    recalculated_df[[i]] <- recalculated_values
-  }
-  
-  # View the recalculated dataframe to inspect the final output
-  print("Recalculated Data Frame:")
-  print(head(recalculated_df))
-  rownames(recalculated_df) <- rownames(filtered_df)
-  mean_expected_df <- recalculated_df
-  
-}
-
-# O/E ratio
-OE_ratio <- filtered_df/recalculated_df
-miRNAs_over_50 <- names(average_RPM[average_RPM > 50])
-temp_OE_ratio <- OE_ratio
-temp_OE_ratio$miRNA <- rownames(temp_OE_ratio)
-temp_OE_ratio <- subset(temp_OE_ratio, miRNA %in% miRNAs_over_50)
-long_ratio_data <- melt(temp_OE_ratio, id.vars = "miRNA", variable.name = "Sample", value.name = "ObservedExpectedRatio")
-long_ratio_data$miRNA <- factor(long_ratio_data$miRNA, levels = miRNAs_over_50[order(average_RPM[miRNAs_over_50])])
-
-max_y <- ceiling(max(long_ratio_data$ObservedExpectedRatio))
-
-# Create the boxplot with custom hover text for individual points
-gg <- ggplot(long_ratio_data, aes(x = miRNA, y = ObservedExpectedRatio)) +
-  geom_boxplot(outlier.shape = NA) +  # Boxplot without displaying outliers
-  geom_jitter(aes(text = paste("miRNA:", miRNA, 
-                               "<br>Sample:", Sample, 
-                               "<br>Observed/Expected Ratio:", round(ObservedExpectedRatio, 2))), 
-              width = 0.2, size = 0.5, color = "blue") +  # Smaller jittered points with hover text
-  labs(x = "miRNA", y = "Observed/Expected Ratio") +
-  ggtitle("Observed/Expected Ratio per miRNA (Filtered by RPM > 50)") +
-  scale_y_continuous(breaks = seq(0, max_y, by = 1)) +  # Add y-axis ticks at every unit
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-# Create the boxplot with a log-scaled y-axis
-
-group_data_with_status <- as.data.frame(group_data_with_status)
-long_ratio_data$expected_direction <- group_data_with_status$monotonicity[match(long_ratio_data$miRNA, rownames(group_data_with_status))]
-
-# boxplot each sample
-long_ratio_data$SampleGroup <- sapply(long_ratio_data$Sample, function(sample) {
-  group_name <- names(groups)[sapply(groups, function(g) sample %in% g)]
-  if (length(group_name) > 0) return(group_name) else return(NA)
-})
-
-
-### 2 only corresponding mouse
-# calculate expected RPM
-
-group_prefixes <- c("20", "40", "60", "80")
-percentages <- c(20, 40, 60, 80) / 100  # Convert to proportions
-remaining_percentages <- 1 - percentages  # Complementary percentages
-
-# Initialize an empty data frame to store recalculated values for each mouse/sample
-mouse_recalculated_df <- data.frame(matrix(nrow = nrow(filtered_df), ncol = 0))
-rownames(mouse_recalculated_df) <- rownames(filtered_df)  # Set row names to match filtered_df
-
-for (i in seq_along(group_prefixes)) {
-  prefix <- group_prefixes[i]
-  percentage <- percentages[i]
-  remaining_percentage <- remaining_percentages[i]
-  
-  # Select columns that start with the current prefix
-  selected_columns <- grep(paste0("^", prefix), colnames(filtered_df), value = TRUE)
-  
-  # Loop through the selected columns and extract the corresponding mouse identifiers
-  for (col in selected_columns) {
-    # Extract the mouse identifier, which is located between the prefix and the "S" or "L" part
-    mouse_id <- sub(paste0("^", prefix, "_(\\d+)[SL]_.*"), "\\1", col)  # Extracts the mouse number
-    
-    # Define the corresponding "S" and "L" columns using the extracted mouse ID
-    S_column <- paste0(mouse_id, "S")
-    L_column <- paste0(mouse_id, "L")
-    
-    # Check if both corresponding columns (e.g., 1S and 1L) exist in filtered_df
-    if (S_column %in% colnames(filtered_df) && L_column %in% colnames(filtered_df)) {
-      # Calculate the weighted value for each row
-      recalculated_values <- (percentage * filtered_df[[S_column]]) + (remaining_percentage * filtered_df[[L_column]])
-      
-      # Add the recalculated values as a new column in mouse_recalculated_df
-      mouse_recalculated_df[[col]] <- recalculated_values
-    }
-  }
-}
-
-# O/E ratio
-mouse_filtered_df <- filtered_df[rownames(mouse_recalculated_df), colnames(mouse_recalculated_df)]
-OE_ratio <- mouse_filtered_df/mouse_recalculated_df
-miRNAs_over_50 <- names(average_RPM[average_RPM > 50])
-temp_OE_ratio <- OE_ratio
-temp_OE_ratio$miRNA <- rownames(temp_OE_ratio)
-temp_OE_ratio <- subset(temp_OE_ratio, miRNA %in% miRNAs_over_50)
-long_ratio_data <- melt(temp_OE_ratio, id.vars = "miRNA", variable.name = "Sample", value.name = "ObservedExpectedRatio")
-long_ratio_data$miRNA <- factor(long_ratio_data$miRNA, levels = miRNAs_over_50[order(average_RPM[miRNAs_over_50])])
-
-long_ratio_data$SampleGroup <- sapply(long_ratio_data$Sample, function(sample) {
-  group_name <- names(groups)[sapply(groups, function(g) sample %in% g)]
-  if (length(group_name) > 0) return(group_name) else return(NA)
-})
-
-long_ratio_data$expected_direction <- group_data_with_status$monotonicity[match(long_ratio_data$miRNA, rownames(group_data_with_status))]
-
-
-# rlog, vst, TMM
-
-
-# expected matrix (group and per mouse)
-# 
-
-
-## assessment
-# the sum of absolute errors
-# O/E ratio
-# log O/E ratios
-
-
-
-# start with "exclusive" miRNAs
-# plot bunch
-# check by mouse
-# median
-
-
-
-

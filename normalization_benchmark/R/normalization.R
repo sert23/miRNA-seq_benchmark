@@ -1,5 +1,13 @@
 # library(DESeq2)
 # change column names
+
+sample_counts_col <- function(p) {
+  # draw indices
+  idx  <- sample.int(n_feats, size = n_draws, replace = TRUE, prob = p)
+  # count occurrences per feature
+  tabulate(idx, nbins = n_feats)
+}
+
 fix_names <- function(input_cols){
   return(gsub("\\_R1\\|grp1", "", input_cols))
 }
@@ -165,6 +173,331 @@ perform_vst <- function(dds) {
   # Return the list of results
   return(vst_results)
 }
+
+# MAP estimator function
+# MAP Estimator Function
+# Implements: π̂_ij^MAP = w_j * (1/I) + (1-w_j) * π̂_ij^MLE
+# where w_j = (I * α_j) / (I * α_j + n_j)
+
+map_estimator <- function(pi_mle, I, alpha_j, n_j) {
+  # Calculate the weight w_j
+  w_j <- (I * alpha_j) / (I * alpha_j + n_j)
+  
+  # Calculate the MAP estimate
+  pi_map <- w_j * (1/I) + (1 - w_j) * pi_mle
+  
+  return(pi_map)
+}
+
+# # Example usage:
+# pi_mle <- 0.01    # MLE estimate (can be a vector of MLEs for multiple miRNAs)
+# I <- 500          # Total number of miRNAs measured
+# alpha_j <- 1      # Prior parameter for sample j (treat as a tuning parameter)
+# n_j <- 1e6         # Total number of reads in sample j
+# 
+# result <- map_estimator(pi_mle, I, alpha_j, n_j)
+# print(result)
+
+generate_monotonic_heatmap <- function(
+    list_of_transformations,
+    groups,
+    rpm_grp,
+    name_map,
+    plot_dir,
+    topN = 100
+) {
+  # 0) setup
+  RAW_DF     <- rpm_grp
+  average_RPM <- rowMeans(RAW_DF, na.rm = TRUE)
+  
+  # 1) pick topN by RPM
+  top100 <- names(sort(average_RPM, decreasing = TRUE))[seq_len(min(topN, length(average_RPM)))]
+  
+  # 2) monotonicity for each normalization
+  mono_list <- lapply(names(list_of_transformations), function(key) {
+    grp100 <- geometric_mean_by_group(
+      list_of_transformations[[key]], groups
+    )[top100, , drop = FALSE]
+    data.frame(
+      miRNA          = rownames(grp100),
+      transformation = key,
+      monotonicity   = apply(grp100, 1, check_monotonicity),
+      stringsAsFactors = FALSE
+    )
+  })
+  heat_df <- dplyr::bind_rows(mono_list)
+  
+  # 3) add log2FC trend
+  idx    <- match(top100, rownames(RAW_DF))
+  fc_vec <- log2(RAW_DF[idx, "100S"] / RAW_DF[idx, "0S"])
+  fc_df  <- data.frame(
+    miRNA          = top100,
+    transformation = "log2FC",
+    monotonicity   = ifelse(
+      fc_vec >  0, "increasing",
+      ifelse(fc_vec <  0, "decreasing", "none")
+    ),
+    stringsAsFactors = FALSE
+  )
+  heat_df <- dplyr::bind_rows(heat_df, fc_df)
+  
+  # 4) factor levels
+  heat_df <- heat_df %>%
+    dplyr::mutate(
+      miRNA = factor(miRNA, levels = top100),
+      transformation = factor(
+        transformation,
+        levels = c(names(list_of_transformations), "log2FC")
+      )
+    )
+  
+  # 5) build heatmap
+  monotone_cols <- c(
+    increasing = "#1b9e77",
+    decreasing = "#d95f02",
+    none       = "#FFFF00"
+  )
+  gg <- ggplot2::ggplot(
+    heat_df,
+    aes(transformation, miRNA, fill = monotonicity)
+  ) +
+    ggplot2::geom_tile(color = "white", linewidth = 0.2) +
+    ggplot2::scale_fill_manual(
+      name   = "Trend",
+      values = monotone_cols,
+      labels = c(
+        increasing = "Increasing",
+        decreasing = "Decreasing",
+        none       = "Non-monotonic"
+      ),
+      na.value = "white"
+    ) +
+    ggplot2::scale_x_discrete(
+      labels = c(name_map, log2FC = "log2FC"),
+      expand = c(0, 0)
+    ) +
+    ggplot2::labs(
+      x     = "Normalization method",
+      y     = paste0("miRNA (top ", length(top100), " by RPM)"),
+      title = "Per-miRNA monotonic trend + log2FC"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      axis.text.x     = element_text(angle = 45, hjust = 1),
+      axis.text.y     = element_text(size = 6),
+      panel.grid.major = element_line(color = "black")
+    )
+  
+  # 6) save to PDF
+  out_dir <- if (length(plot_dir) > 1) plot_dir[1] else plot_dir
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  pdf(file.path(out_dir, "heatmap_wFC.pdf"), width = 8, height = 10)
+  print(gg)
+  dev.off()
+  
+  message("done")
+  invisible(gg)
+}
+
+
+generate_correlation_heatmap_old <- function(
+    list_of_transformations,
+    groups,
+    rpm_grp,
+    name_map,
+    plot_dir,
+    ref_miRNA,
+    topN = 100
+) {
+  # 0) Validate that ref_miRNA exists in raw RPM data
+  if (!ref_miRNA %in% rownames(rpm_grp)) {
+    stop("Reference miRNA '", ref_miRNA, "' not found in rpm_grp.")
+  }
+  
+  # 1) Prepare output directory
+  out_dir <- plot_dir[1]
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  # 2) Select topN miRNAs by raw RPM mean
+  avg_rpm <- rowMeans(rpm_grp, na.rm = TRUE)
+  miRNAs  <- names(sort(avg_rpm, decreasing = TRUE))[seq_len(min(topN, length(avg_rpm)))]
+  
+  # 3) Compute Pearson correlation for each transformation
+  corr_list <- lapply(names(list_of_transformations), function(key) {
+    mat <- list_of_transformations[[key]]
+    # Ensure reference miRNA exists in this transformation
+    if (!ref_miRNA %in% rownames(mat)) {
+      stop("Reference miRNA '", ref_miRNA, "' not found in transformation '", key, "'.")
+    }
+    # Subset to top miRNAs and all samples
+    mat_sub     <- mat[miRNAs, , drop = FALSE]
+    ref_vec     <- as.numeric(mat[ref_miRNA, , drop = TRUE])
+    # Compute correlations, coercing each profile to numeric
+    cors <- apply(mat_sub, 1, function(vals) {
+      stats::cor(as.numeric(vals), ref_vec, use = "pairwise.complete.obs")
+    })
+    data.frame(
+      miRNA          = miRNAs,
+      transformation = key,
+      correlation    = cors,
+      stringsAsFactors = FALSE
+    )
+  })
+  corr_df <- dplyr::bind_rows(corr_list)
+  
+  # 4) Factor levels for plotting
+  corr_df <- corr_df %>%
+    dplyr::mutate(
+      miRNA          = factor(miRNA, levels = rev(miRNAs)),
+      transformation = factor(transformation, levels = names(list_of_transformations))
+    )
+  
+  # 5) Build heatmap
+  heatmap_plot <- ggplot2::ggplot(
+    corr_df,
+    ggplot2::aes(x = transformation, y = miRNA, fill = correlation)
+  ) +
+    ggplot2::geom_tile(color = "white", linewidth = 0.2) +
+    ggplot2::scale_fill_gradient2(
+      name     = "Pearson R",
+      low      = "#d73027",
+      mid      = "#ffffbf",
+      high     = "#1a9850",
+      midpoint = 0,
+      na.value = "white"
+    ) +
+    ggplot2::scale_x_discrete(labels = name_map, expand = c(0, 0)) +
+    ggplot2::labs(
+      x     = "Normalization method",
+      y     = paste0("miRNA (top ", length(miRNAs), " by RPM)"),
+      title = paste0("Correlation to ", ref_miRNA)
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      axis.text.x      = ggplot2::element_text(angle = 45, hjust = 1),
+      axis.text.y      = ggplot2::element_text(size = 6),
+      panel.grid.major = ggplot2::element_line(color = "white")
+    )
+  
+  # 6) Save to PDF
+  out_file <- file.path(out_dir, paste0("corr_to_", ref_miRNA, ".pdf"))
+  ggplot2::ggsave(out_file, heatmap_plot, width = 8, height = 10)
+  
+  message("Correlation heatmap saved to: ", out_file)
+  invisible(heatmap_plot)
+}
+
+generate_correlation_heatmap <- function(
+    list_of_transformations,
+    groups,
+    rpm_grp,
+    name_map,
+    plot_dir,
+    ref_miRNA,
+    # ref_transform = "RPM_lib",
+    ref_transform = "rlog_parametric_blind_TRUE",
+    topN = 100
+) {
+  # 0) Validate reference transformation and miRNA
+  if (!ref_transform %in% names(list_of_transformations)) {
+    stop("Reference transformation '", ref_transform, "' not found in list_of_transformations.")
+  }
+  ref_mat <- list_of_transformations[[ref_transform]]
+  if (!ref_miRNA %in% rownames(ref_mat)) {
+    stop("Reference miRNA '", ref_miRNA, "' not found in transformation '", ref_transform, "'.")
+  }
+  
+  # 1) Prepare output directory
+  out_dir <- plot_dir[1]
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  # 2) Select topN miRNAs by raw RPM mean
+  avg_rpm <- rowMeans(rpm_grp, na.rm = TRUE)
+  miRNAs  <- names(sort(avg_rpm, decreasing = TRUE))[seq_len(min(topN, length(avg_rpm)))]
+  
+  # 3) Extract reference profile from chosen transformation
+  ref_vec <- as.numeric(ref_mat[ref_miRNA, , drop = TRUE])
+  ref_samples <- colnames(ref_mat)
+  
+  # 4) Compute Pearson correlation for each transformation
+  corr_list <- lapply(names(list_of_transformations), function(key) {
+    mat <- list_of_transformations[[key]]
+    # Subset to top miRNAs and common samples
+    mat_sub <- mat[miRNAs, ref_samples, drop = FALSE]
+    # Compute correlations
+    cors <- apply(mat_sub, 1, function(vals) {
+      stats::cor(as.numeric(vals), ref_vec, use = "pairwise.complete.obs")
+    })
+    data.frame(
+      miRNA          = miRNAs,
+      transformation = key,
+      correlation    = cors,
+      stringsAsFactors = FALSE
+    )
+  })
+  corr_df <- dplyr::bind_rows(corr_list)
+  
+  # 5) Factor levels for plotting
+  corr_df <- corr_df %>%
+    dplyr::mutate(
+      miRNA          = factor(miRNA, levels = rev(miRNAs)),
+      transformation = factor(transformation, levels = names(list_of_transformations))
+    )
+  
+  # 6) Build heatmap
+  heatmap_plot <- ggplot2::ggplot(
+    corr_df,
+    ggplot2::aes(x = transformation, y = miRNA, fill = correlation)
+  ) +
+    ggplot2::geom_tile(color = "white", linewidth = 0.2) +
+    ggplot2::scale_fill_gradient2(
+      name     = "Pearson R",
+      low      = "#d73027",
+      mid      = "#ffffbf",
+      high     = "#1a9850",
+      midpoint = 0,
+      na.value = "white"
+    ) +
+    ggplot2::scale_x_discrete(labels = name_map, expand = c(0, 0)) +
+    ggplot2::labs(
+      x     = "Normalization method",
+      y     = paste0("miRNA (top ", length(miRNAs), " by RPM)"),
+      title = paste0("Correlation to ", ref_miRNA, " (", ref_transform, ")")
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      axis.text.x      = ggplot2::element_text(angle = 45, hjust = 1),
+      axis.text.y      = ggplot2::element_text(size = 6),
+      panel.grid.major = ggplot2::element_line(color = "white")
+    )
+  
+  # 7) Save to PDF
+  out_file <- file.path(
+    out_dir,
+    paste0("corr_to_", ref_miRNA, "_", ref_transform, ".pdf")
+  )
+  ggplot2::ggsave(out_file, heatmap_plot, width = 8, height = 10)
+  
+  message("Correlation heatmap saved to: ", out_file)
+  invisible(heatmap_plot)
+}
+
+# "RC"
+# [1] "RPM_total"
+# [1] "RPM_lib"
+# [1] "MAP"
+# [1] "rlog_parametric_blind_TRUE"
+# [1] "rlog_mean_blind_FALSE"
+# [1] "vst_local_blind_TRUE"
+# [1] "TMM"
+
+
+
+
+
+
+
+
 
 # calculate expected values (average)
 # calculate expected values (per mouse)
